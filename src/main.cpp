@@ -25,8 +25,8 @@
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 1.2;
-double Ki = 0.4;
+double Kp = 24;
+double Ki = 0;
 double Kd = 0;
 
 double setpoint = 0;
@@ -99,9 +99,10 @@ class Motor {
     long prevCount = 0;
     unsigned long prevTime = 0;
     bool isEncInterrupt = false;
-    float motor_rpm = 0;
+    static float motor_rpm;
     double _pid_input, _pid_output, _pid_setpoint = 0;
-    double _Kp, _Ki, _Kd;
+    double _Kp = 0, _Ki = 0, _Kd = 0;
+    PID* Motor_pid;
 
     Motor(bool reversed, uint8_t ena_pin, uint8_t in1_pin, uint8_t in2_pin, uint8_t enc_a_pin, uint8_t enc_b_pin) {
       _isReversed = reversed;
@@ -112,7 +113,7 @@ class Motor {
       _enc_b_pin = enc_b_pin;  
       // Reset value on startup
       enc_count = 0; 
-      
+      motor_rpm = 0;
 
       if(ena_pin == LEFT_MOTOR_ENA){
         ledcSetup(LEFT_PWM_CHANNEL, 1000, 8);
@@ -127,10 +128,10 @@ class Motor {
       pinMode(_enc_a_pin, INPUT_PULLUP);
       pinMode(_enc_b_pin, INPUT_PULLUP);
 
-      PID pid(&_pid_input, &_pid_output, &_pid_setpoint, _Kp, _Ki, _Kd, DIRECT);
-      pid.SetMode(AUTOMATIC);
-      pid.SetSampleTime(10);
-      pid.SetOutputLimits(0, 5000); // Max RPM motor
+      Motor_pid = new PID(&_pid_input, &_pid_output, &_pid_setpoint, _Kp, _Ki, _Kd, DIRECT);
+      Motor_pid->SetMode(AUTOMATIC);
+      Motor_pid->SetSampleTime(50); // 50ms same as encoder pooling rate
+      Motor_pid->SetOutputLimits(0, 255);
     }
 
     float ReadMotorSpeed(){
@@ -146,16 +147,23 @@ class Motor {
         }
         isEncInterrupt = true;
       }
-      // Read every 100 ms
+      
+      // Read every 50 ms
       unsigned long now = millis();
-      if (now - prevTime >= 100){
-        long delta = enc_count - prevCount;
-        float cps = (delta * 1000.0) / (now - prevTime);
-        // CPR = 11PPR x 4 (Quadrature reading)
-        const int CPR = 44;
-        motor_rpm = (cps * 60.0) / CPR;
+      if (now - prevTime >= 50){
+        noInterrupts();
+        long currentCount = enc_count;
+        interrupts();
 
-        prevCount = enc_count;
+        long delta = currentCount - prevCount;
+        float deltaTime = (now - prevTime) / 1000.0; // seconds
+
+        const int CPR = 44;
+        float rpm_raw = (delta / deltaTime) * 60.0 / CPR;
+
+        motor_rpm = FilterRPM(rpm_raw); 
+    
+        prevCount = currentCount;
         prevTime = now;
       }
       return motor_rpm;
@@ -163,12 +171,12 @@ class Motor {
 
     void SetMotorSpeed(float _speed){
       _pid_setpoint = _speed;
-      _pid_input = ReadMotorSpeed();
-      pid.Compute();
+      _pid_input = abs(ReadMotorSpeed());
+      Motor_pid->Compute();
       if (_ena_pin == LEFT_MOTOR_ENA)
-        ledcWrite(LEFT_PWM_CHANNEL, _pid_output);
+        ledcWrite(LEFT_PWM_CHANNEL, uint8_t(_pid_output));
       else if (_ena_pin == RIGHT_MOTOR_ENA)
-        ledcWrite(RIGHT_PWM_CHANNEL, _pid_output);
+        ledcWrite(RIGHT_PWM_CHANNEL, uint8_t(_pid_output));
     }
 
     void MoveForward(float _speed){
@@ -202,6 +210,37 @@ class Motor {
       digitalWrite(_in1_pin, LOW);
       digitalWrite(_in2_pin, LOW);
     }
+
+    void SetKpid(double Kp, double Ki, double Kd) {
+      _Kp = Kp;
+      _Ki = Ki;
+      _Kd = Kd;
+      Motor_pid->SetTunings(_Kp, _Ki, _Kd);
+    }
+
+  private:
+    float Median3(float a, float b, float c){
+      if (a > b) { float temp=a; a=b; b=temp; }
+      if (b > c) { float temp=b; b=c; c=temp; }
+      if (a > b) { float temp=a; a=b; b=temp; }
+
+      return b;
+    }
+
+    float FilterRPM(float raw){
+      static float v1 = 0, v2 = 0;
+      static float ema = 0;
+      static bool init = false;
+
+      float med = Median3(raw, v1, v2);
+      v2 = v1; v1 = raw;
+      // EMA smoothing
+      float alpha = 0.25; // 0.1 = smoother, 0.3 = faster response
+      if (!init) { ema = med; init = true; }
+      ema += alpha * (med - ema);
+
+      return ema;
+    }
 };
 
 Motor leftMotor(true, LEFT_MOTOR_ENA, LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, LEFT_ENC_A, LEFT_ENC_B);
@@ -231,8 +270,6 @@ uint8_t* setMotorMoveRatio(uint8_t _ma_ratio, uint8_t _mb_ratio, uint8_t _speed,
 
   return motor_speed;
 }
-
-
 
 void onConnectedController(ControllerPtr ctl) {
   bool foundEmptySlot = false;
@@ -485,7 +522,10 @@ void setup() {
 
   pid.SetMode(AUTOMATIC);
   pid.SetSampleTime(10);
-  pid.SetOutputLimits(-255, 255);
+  pid.SetOutputLimits(-5000, 5000); // Max Motor Speed
+
+  rightMotor.SetKpid(0.10, 0.08, 0.018);
+  leftMotor.SetKpid(0.10, 0.010, 0.018);
 }
 
 void loop() {
@@ -510,13 +550,13 @@ void loop() {
     // Safety
     if (input > -100 && input < 100){
       // Speeds [0] = Right [1] = Left
-      uint8_t* speeds = setMotorMoveRatio(1, 1, output, rightMotor, leftMotor);
+      // uint8_t* speeds = setMotorMoveRatio(1, 1, output, rightMotor, leftMotor);
       if(input < setpoint + deadband){
-        rightMotor.MoveBackward(abs(speeds[0]));
-        leftMotor.MoveBackward(abs(speeds[1]));
+        rightMotor.MoveBackward(abs(2000));
+        leftMotor.MoveBackward(abs(2000));
       }else if(input > setpoint - deadband){
-        rightMotor.MoveForward(abs(speeds[0]));
-        leftMotor.MoveForward(abs(speeds[1]));
+        rightMotor.MoveForward(abs(2000));
+        leftMotor.MoveForward(abs(2000));
       }else{
         rightMotor.MotorStop();
         leftMotor.MotorStop();
@@ -528,7 +568,13 @@ void loop() {
   }
 
   // For diagnostis using serial plotter
-  Serial.print(leftMotor.ReadMotorSpeed());
+  // Serial.print(leftMotor.ReadMotorSpeed());
+  // Serial.print("\t");
+  // Serial.println(rightMotor.ReadMotorSpeed());
+  // Serial.print(setpoint);
+  // Serial.print("\t");
+  // Serial.println(output);
+  Serial.print(leftMotor._pid_input);
   Serial.print("\t");
-  Serial.println(rightMotor.ReadMotorSpeed());
+  Serial.println(rightMotor._pid_input);
 }
