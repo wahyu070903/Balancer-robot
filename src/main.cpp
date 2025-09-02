@@ -51,42 +51,54 @@ volatile long* ITR_enc_count_R;
 volatile long* ITR_enc_count_L;
 
 void IRAM_ATTR handleEncoderAR() {
-    if (digitalRead(RIGHT_ENC_A) == digitalRead(RIGHT_ENC_B)) {
-    // Clockwise
-    (*ITR_enc_count_R)++;
+  bool A = digitalRead(RIGHT_ENC_A);
+  bool B = digitalRead(RIGHT_ENC_B);
+  
+  if (A == HIGH) {
+    if (B == LOW) (*ITR_enc_count_R)++;
+    else (*ITR_enc_count_R)--;
   } else {
-    // Counter-clockwise
-    (*ITR_enc_count_R)--;
+    if (B == HIGH) (*ITR_enc_count_R)++;
+    else (*ITR_enc_count_R)--;
   }
 }
 
 void IRAM_ATTR handleEncoderBR() {
-  if (digitalRead(RIGHT_ENC_A) != digitalRead(RIGHT_ENC_B)) {
-    // Clockwise
-    (*ITR_enc_count_R)++;
+  bool A = digitalRead(RIGHT_ENC_A);
+  bool B = digitalRead(RIGHT_ENC_B);
+  
+  if (B == HIGH) {
+    if (A == HIGH) (*ITR_enc_count_R)++;
+    else (*ITR_enc_count_R)--;
   } else {
-    // Counter-clockwise
-    (*ITR_enc_count_R)--;
+    if (A == LOW) (*ITR_enc_count_R)++;
+    else (*ITR_enc_count_R)--;
   }
 }
 
 void IRAM_ATTR handleEncoderAL() {
-    if (digitalRead(LEFT_ENC_A) == digitalRead(LEFT_ENC_B)) {
-    // Clockwise
-    (*ITR_enc_count_L)++;
+  bool A = digitalRead(LEFT_ENC_A);
+  bool B = digitalRead(LEFT_ENC_B);
+  
+  if (A == HIGH) {
+    if (B == LOW) (*ITR_enc_count_L)++;
+    else (*ITR_enc_count_L)--;
   } else {
-    // Counter-clockwise
-    (*ITR_enc_count_L)--;
+    if (B == HIGH) (*ITR_enc_count_L)++;
+    else (*ITR_enc_count_L)--;
   }
 }
 
 void IRAM_ATTR handleEncoderBL() {
-  if (digitalRead(LEFT_ENC_A) != digitalRead(LEFT_ENC_B)) {
-    // Clockwise
-    (*ITR_enc_count_L)++;
+  bool A = digitalRead(LEFT_ENC_A);
+  bool B = digitalRead(LEFT_ENC_B);
+  
+  if (B == HIGH) {
+    if (A == HIGH) (*ITR_enc_count_L)++;
+    else (*ITR_enc_count_L)--;
   } else {
-    // Counter-clockwise
-    (*ITR_enc_count_L)--;
+    if (A == LOW) (*ITR_enc_count_L)++;
+    else (*ITR_enc_count_L)--;
   }
 }
 
@@ -99,7 +111,7 @@ class Motor {
     long prevCount = 0;
     unsigned long prevTime = 0;
     bool isEncInterrupt = false;
-    static float motor_rpm;
+    float motor_rpm = 0;
     double _pid_input, _pid_output, _pid_setpoint = 0;
     double _Kp = 0, _Ki = 0, _Kd = 0;
     PID* Motor_pid;
@@ -112,8 +124,9 @@ class Motor {
       _enc_a_pin = enc_a_pin;
       _enc_b_pin = enc_b_pin;  
       // Reset value on startup
-      enc_count = 0; 
-      motor_rpm = 0;
+      enc_count = 0;
+      ITR_enc_count_R = 0;
+      ITR_enc_count_L = 0;
 
       if(ena_pin == LEFT_MOTOR_ENA){
         ledcSetup(LEFT_PWM_CHANNEL, 1000, 8);
@@ -173,10 +186,13 @@ class Motor {
       _pid_setpoint = _speed;
       _pid_input = abs(ReadMotorSpeed());
       Motor_pid->Compute();
+      int pwm_output = (int)_pid_output;
+      pwm_output = constrain(pwm_output, 0, 255);
+
       if (_ena_pin == LEFT_MOTOR_ENA)
-        ledcWrite(LEFT_PWM_CHANNEL, uint8_t(_pid_output));
+        ledcWrite(LEFT_PWM_CHANNEL, uint8_t(pwm_output));
       else if (_ena_pin == RIGHT_MOTOR_ENA)
-        ledcWrite(RIGHT_PWM_CHANNEL, uint8_t(_pid_output));
+        ledcWrite(RIGHT_PWM_CHANNEL, uint8_t(pwm_output));
     }
 
     void MoveForward(float _speed){
@@ -209,6 +225,10 @@ class Motor {
 
       digitalWrite(_in1_pin, LOW);
       digitalWrite(_in2_pin, LOW);
+
+      _pid_input = 0;
+      _pid_output = 0;
+      enc_count = 0;
     }
 
     void SetKpid(double Kp, double Ki, double Kd) {
@@ -246,30 +266,30 @@ class Motor {
 Motor leftMotor(true, LEFT_MOTOR_ENA, LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, LEFT_ENC_A, LEFT_ENC_B);
 Motor rightMotor(true, RIGHT_MOTOR_ENA, RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, RIGHT_ENC_A, RIGHT_ENC_B);
 
-uint8_t* setMotorMoveRatio(uint8_t _ma_ratio, uint8_t _mb_ratio, uint8_t _speed, Motor& rightMotor, Motor& leftMotor) {
-  static uint8_t motor_speed[2] = {0, 0};
+// uint8_t* setMotorMoveRatio(uint8_t _ma_ratio, uint8_t _mb_ratio, uint8_t _speed, Motor& rightMotor, Motor& leftMotor) {
+//   static uint8_t motor_speed[2] = {0, 0};
 
-  float mr_speed = abs(rightMotor.ReadMotorSpeed());
-  float ml_speed = abs(leftMotor.ReadMotorSpeed());
+//   float mr_speed = abs(rightMotor.ReadMotorSpeed());
+//   float ml_speed = abs(leftMotor.ReadMotorSpeed());
 
-  // target = rata-rata biar motor sinkron
-  float target = (mr_speed + ml_speed) / 2.0;
+//   // target = rata-rata biar motor sinkron
+//   float target = (mr_speed + ml_speed) / 2.0;
 
-  float Kp = 5;  // coba kecil dulu
-  float error_r = target - mr_speed;
-  float error_l = target - ml_speed;
+//   float Kp = 5;  // coba kecil dulu
+//   float error_r = target - mr_speed;
+//   float error_l = target - ml_speed;
 
-  int pwm_r = _speed + (int)(Kp * error_r);
-  int pwm_l = _speed + (int)(Kp * error_l);
+//   int pwm_r = _speed + (int)(Kp * error_r);
+//   int pwm_l = _speed + (int)(Kp * error_l);
 
-  pwm_r = constrain(abs(pwm_r), 0, 255);
-  pwm_l = constrain(abs(pwm_l), 0, 255);
+//   pwm_r = constrain(abs(pwm_r), 0, 255);
+//   pwm_l = constrain(abs(pwm_l), 0, 255);
 
-  motor_speed[0] = (uint8_t)pwm_r; // kanan
-  motor_speed[1] = (uint8_t)pwm_l; // kiri
+//   motor_speed[0] = (uint8_t)pwm_r; // kanan
+//   motor_speed[1] = (uint8_t)pwm_l; // kiri
 
-  return motor_speed;
-}
+//   return motor_speed;
+// }
 
 void onConnectedController(ControllerPtr ctl) {
   bool foundEmptySlot = false;
@@ -552,11 +572,11 @@ void loop() {
       // Speeds [0] = Right [1] = Left
       // uint8_t* speeds = setMotorMoveRatio(1, 1, output, rightMotor, leftMotor);
       if(input < setpoint + deadband){
-        rightMotor.MoveBackward(abs(2000));
-        leftMotor.MoveBackward(abs(2000));
+        rightMotor.MoveBackward(abs(4000));
+        leftMotor.MoveBackward(abs(4000));
       }else if(input > setpoint - deadband){
-        rightMotor.MoveForward(abs(2000));
-        leftMotor.MoveForward(abs(2000));
+        rightMotor.MoveForward(abs(4000));
+        leftMotor.MoveForward(abs(4000));
       }else{
         rightMotor.MotorStop();
         leftMotor.MotorStop();
@@ -574,6 +594,7 @@ void loop() {
   // Serial.print(setpoint);
   // Serial.print("\t");
   // Serial.println(output);
+
   Serial.print(leftMotor._pid_input);
   Serial.print("\t");
   Serial.println(rightMotor._pid_input);
