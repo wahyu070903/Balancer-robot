@@ -2,6 +2,7 @@
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <PID_v1.h>
 #include <Bluepad32.h>
+#include "driver/pcnt.h"
 
 #define IMU_SCL 22
 #define IMU_SDA 21
@@ -25,12 +26,12 @@
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 24;
-double Ki = 0;
-double Kd = 0;
+double Kp = 62;
+double Ki = 4.8 ;
+double Kd = 0.6;
 
 double setpoint = 0;
-float deadband = 3.0;
+float deadband = 2.0;
 double input, output;
 volatile bool dmp_ready;
 
@@ -38,68 +39,15 @@ uint16_t packetSize;
 uint16_t fifoCount;
 uint8_t fifoBuffer[64] = {0};
 
+pcnt_unit_t pcnt_unit_left = PCNT_UNIT_0;
+pcnt_unit_t pcnt_unit_right = PCNT_UNIT_1;
+
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 MPU6050 mpu;
 
 void IRAM_ATTR dmpDataReady() {
   dmp_ready = true;
-}
-
-// Virtual parameter for IRAM_ATTR
-volatile long* ITR_enc_count_R;
-volatile long* ITR_enc_count_L;
-
-void IRAM_ATTR handleEncoderAR() {
-  bool A = digitalRead(RIGHT_ENC_A);
-  bool B = digitalRead(RIGHT_ENC_B);
-  
-  if (A == HIGH) {
-    if (B == LOW) (*ITR_enc_count_R)++;
-    else (*ITR_enc_count_R)--;
-  } else {
-    if (B == HIGH) (*ITR_enc_count_R)++;
-    else (*ITR_enc_count_R)--;
-  }
-}
-
-void IRAM_ATTR handleEncoderBR() {
-  bool A = digitalRead(RIGHT_ENC_A);
-  bool B = digitalRead(RIGHT_ENC_B);
-  
-  if (B == HIGH) {
-    if (A == HIGH) (*ITR_enc_count_R)++;
-    else (*ITR_enc_count_R)--;
-  } else {
-    if (A == LOW) (*ITR_enc_count_R)++;
-    else (*ITR_enc_count_R)--;
-  }
-}
-
-void IRAM_ATTR handleEncoderAL() {
-  bool A = digitalRead(LEFT_ENC_A);
-  bool B = digitalRead(LEFT_ENC_B);
-  
-  if (A == HIGH) {
-    if (B == LOW) (*ITR_enc_count_L)++;
-    else (*ITR_enc_count_L)--;
-  } else {
-    if (B == HIGH) (*ITR_enc_count_L)++;
-    else (*ITR_enc_count_L)--;
-  }
-}
-
-void IRAM_ATTR handleEncoderBL() {
-  bool A = digitalRead(LEFT_ENC_A);
-  bool B = digitalRead(LEFT_ENC_B);
-  
-  if (B == HIGH) {
-    if (A == HIGH) (*ITR_enc_count_L)++;
-    else (*ITR_enc_count_L)--;
-  } else {
-    if (A == LOW) (*ITR_enc_count_L)++;
-    else (*ITR_enc_count_L)--;
-  }
 }
 
 class Motor {
@@ -125,17 +73,52 @@ class Motor {
       _enc_b_pin = enc_b_pin;  
       // Reset value on startup
       enc_count = 0;
-      ITR_enc_count_R = 0;
-      ITR_enc_count_L = 0;
 
       if(ena_pin == LEFT_MOTOR_ENA){
         ledcSetup(LEFT_PWM_CHANNEL, 1000, 8);
         ledcAttachPin(ena_pin, LEFT_PWM_CHANNEL);
+
+        // Configure PCNT
+        pcnt_config_t pcnt_config_left = {
+          .pulse_gpio_num = LEFT_ENC_A,
+          .ctrl_gpio_num = LEFT_ENC_B,
+          .lctrl_mode = PCNT_MODE_KEEP,
+          .hctrl_mode = PCNT_MODE_REVERSE,
+          .pos_mode = PCNT_COUNT_INC,
+          .neg_mode = PCNT_COUNT_DEC,
+          .counter_h_lim = 32767,
+          .counter_l_lim = -32768,
+          .unit = pcnt_unit_left,
+          .channel = PCNT_CHANNEL_0
+        };
+        pcnt_unit_config(&pcnt_config_left);
+        pcnt_counter_pause(pcnt_unit_left);
+        pcnt_counter_clear(pcnt_unit_left);
+        pcnt_counter_resume(pcnt_unit_left);
+
       }else if(ena_pin == RIGHT_MOTOR_ENA){
         ledcSetup(RIGHT_PWM_CHANNEL, 1000, 8);
         ledcAttachPin(ena_pin, RIGHT_PWM_CHANNEL);
-      }
 
+        // Configure PCNT
+        pcnt_config_t pcnt_config_right = {
+          .pulse_gpio_num = RIGHT_ENC_A,
+          .ctrl_gpio_num = RIGHT_ENC_B,
+          .lctrl_mode = PCNT_MODE_KEEP,
+          .hctrl_mode = PCNT_MODE_REVERSE,
+          .pos_mode = PCNT_COUNT_INC,
+          .neg_mode = PCNT_COUNT_DEC,
+          .counter_h_lim = 32767,
+          .counter_l_lim = -32768,
+          .unit = pcnt_unit_right,
+          .channel = PCNT_CHANNEL_0
+        };
+        pcnt_unit_config(&pcnt_config_right);
+        pcnt_counter_pause(pcnt_unit_right);
+        pcnt_counter_clear(pcnt_unit_right);
+        pcnt_counter_resume(pcnt_unit_right);
+      }
+      
       pinMode(_in1_pin, OUTPUT);
       pinMode(_in2_pin, OUTPUT);
       pinMode(_enc_a_pin, INPUT_PULLUP);
@@ -148,35 +131,26 @@ class Motor {
     }
 
     float ReadMotorSpeed(){
-      if(!isEncInterrupt){
-        if(_enc_a_pin == LEFT_ENC_A){
-          attachInterrupt(digitalPinToInterrupt(_enc_a_pin), handleEncoderAL, CHANGE);
-          attachInterrupt(digitalPinToInterrupt(_enc_b_pin), handleEncoderBL, CHANGE);
-          ITR_enc_count_L = &enc_count;
-        } else {
-          attachInterrupt(digitalPinToInterrupt(_enc_a_pin), handleEncoderAR, CHANGE);
-          attachInterrupt(digitalPinToInterrupt(_enc_b_pin), handleEncoderBR, CHANGE);
-          ITR_enc_count_R = &enc_count;
-        }
-        isEncInterrupt = true;
+      int16_t count = 0;
+      if(_enc_a_pin == LEFT_ENC_A){
+        pcnt_get_counter_value(pcnt_unit_left, &count);
+      } else {
+        pcnt_get_counter_value(pcnt_unit_right, &count);
       }
       
       // Read every 50 ms
       unsigned long now = millis();
-      if (now - prevTime >= 50){
-        noInterrupts();
-        long currentCount = enc_count;
-        interrupts();
+      if (now - prevTime >= 50) {
+        long delta = count - prevCount;
+        if (delta > 30000) delta -= 65536;
+        if (delta < -30000) delta += 65536;
+        
+        float deltaTime = (now - prevTime) / 1000.0; // in Seconds
 
-        long delta = currentCount - prevCount;
-        float deltaTime = (now - prevTime) / 1000.0; // seconds
+        float rpm = (delta / deltaTime) * 60.0 / 44; // 44 = CPR
+        motor_rpm = rpm;
 
-        const int CPR = 44;
-        float rpm_raw = (delta / deltaTime) * 60.0 / CPR;
-
-        motor_rpm = FilterRPM(rpm_raw); 
-    
-        prevCount = currentCount;
+        prevCount = count;
         prevTime = now;
       }
       return motor_rpm;
@@ -229,6 +203,9 @@ class Motor {
       _pid_input = 0;
       _pid_output = 0;
       enc_count = 0;
+
+      Motor_pid->SetMode(MANUAL);
+      Motor_pid->SetMode(AUTOMATIC);
     }
 
     void SetKpid(double Kp, double Ki, double Kd) {
@@ -264,7 +241,7 @@ class Motor {
 };
 
 Motor leftMotor(true, LEFT_MOTOR_ENA, LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, LEFT_ENC_A, LEFT_ENC_B);
-Motor rightMotor(true, RIGHT_MOTOR_ENA, RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, RIGHT_ENC_A, RIGHT_ENC_B);
+Motor rightMotor(false, RIGHT_MOTOR_ENA, RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, RIGHT_ENC_A, RIGHT_ENC_B);
 
 // uint8_t* setMotorMoveRatio(uint8_t _ma_ratio, uint8_t _mb_ratio, uint8_t _speed, Motor& rightMotor, Motor& leftMotor) {
 //   static uint8_t motor_speed[2] = {0, 0};
@@ -544,58 +521,72 @@ void setup() {
   pid.SetSampleTime(10);
   pid.SetOutputLimits(-5000, 5000); // Max Motor Speed
 
-  rightMotor.SetKpid(0.10, 0.08, 0.018);
-  leftMotor.SetKpid(0.10, 0.010, 0.018);
+  rightMotor.SetKpid(0.14, 0.64, 0.018);
+  leftMotor.SetKpid(0.14, 0.64, 0.018);
 }
 
 void loop() {
-  bool dataUpdated = BP32.update();
-  if (dataUpdated) processControllers();
-  if(dmp_ready){
-    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
-      Quaternion q;
-      VectorFloat gravity;
-      float ypr[3];
+  // bool dataUpdated = BP32.update();
+  // if (dataUpdated) processControllers();
+  // if(dmp_ready){
+  //   if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+  //     Quaternion q;
+  //     VectorFloat gravity;
+  //     float ypr[3];
 
-      mpu.dmpGetQuaternion(&q, fifoBuffer);
-      mpu.dmpGetGravity(&gravity, &q);
-      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+  //     mpu.dmpGetQuaternion(&q, fifoBuffer);
+  //     mpu.dmpGetGravity(&gravity, &q);
+  //     mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-      float robot_angle = ypr[1] * 180/M_PI; // pitch angle
-      input = robot_angle;
-    }
-    dmp_ready = false;
-  }else{
-    pid.Compute();
-    // Safety
-    if (input > -100 && input < 100){
-      // Speeds [0] = Right [1] = Left
-      // uint8_t* speeds = setMotorMoveRatio(1, 1, output, rightMotor, leftMotor);
-      if(input < setpoint + deadband){
-        rightMotor.MoveBackward(abs(4000));
-        leftMotor.MoveBackward(abs(4000));
-      }else if(input > setpoint - deadband){
-        rightMotor.MoveForward(abs(4000));
-        leftMotor.MoveForward(abs(4000));
-      }else{
-        rightMotor.MotorStop();
-        leftMotor.MotorStop();
-      }
-    }else{
-      rightMotor.MotorStop();
-      leftMotor.MotorStop();
-    }
-  }
+  //     float robot_angle = ypr[1] * 180/M_PI; // pitch angle
+  //     input = robot_angle;
+  //   }
+  //   dmp_ready = false;
+  // }else{
+  //   pid.Compute();
+  //   // Safety
+  //   if (input > -35 && input < 35){
+  //     if(input < setpoint - deadband){
+  //       // If robot falling backward, move backward
+  //       rightMotor.MoveBackward(abs(output));
+  //       leftMotor.MoveBackward(abs(output));
+  //     }else if(input > setpoint + deadband){
+  //       // If robot fallig forward, move forward
+  //       rightMotor.MoveForward(abs(output));
+  //       leftMotor.MoveForward(abs(output));
+  //     }else{
+  //       rightMotor.MotorStop();
+  //       leftMotor.MotorStop();
+  //       input = 0;
+  //       output =0;
+  //       pid.SetMode(MANUAL);
+  //       pid.SetMode(AUTOMATIC);
+  //     }
+  //   }else{
+  //     rightMotor.MotorStop();
+  //     leftMotor.MotorStop();
+  //     input = 0;
+  //     output =0;
+  //     pid.SetMode(MANUAL);
+  //     pid.SetMode(AUTOMATIC);
+  //   }
+  // }
 
+  leftMotor.MoveForward(2000);
+  rightMotor.MoveForward(2000);
+
+  // leftMotor.MoveForward(2000);
+  // rightMotor.MoveForward(2000);
   // For diagnostis using serial plotter
   // Serial.print(leftMotor.ReadMotorSpeed());
   // Serial.print("\t");
   // Serial.println(rightMotor.ReadMotorSpeed());
-  // Serial.print(setpoint);
+  // Serial.print(leftMotor._pid_input);
   // Serial.print("\t");
-  // Serial.println(output);
-
+  // Serial.println(rightMotor._pid_input);
   Serial.print(leftMotor._pid_input);
   Serial.print("\t");
   Serial.println(rightMotor._pid_input);
+  // Serial.print("\t");
+  // Serial.println(input);
 }
