@@ -26,12 +26,12 @@
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 62;
-double Ki = 4.8 ;
-double Kd = 0.6;
+double Kp = 12; //80
+double Ki = 0;
+double Kd = 1.6;
 
 double setpoint = 0;
-float deadband = 2.0;
+float deadband = 0;
 double input, output;
 volatile bool dmp_ready;
 
@@ -142,9 +142,6 @@ class Motor {
       unsigned long now = millis();
       if (now - prevTime >= 50) {
         long delta = count - prevCount;
-        if (delta > 30000) delta -= 65536;
-        if (delta < -30000) delta += 65536;
-        
         float deltaTime = (now - prevTime) / 1000.0; // in Seconds
 
         float rpm = (delta / deltaTime) * 60.0 / 44; // 44 = CPR
@@ -496,6 +493,12 @@ void setup() {
 
   Serial.println("Inisialisasi MPU6050...");
   mpu.initialize();
+  mpu.setXGyroOffset(157);
+  mpu.setYGyroOffset(70);
+  mpu.setZGyroOffset(-107);
+  mpu.setXAccelOffset(342);
+  mpu.setYAccelOffset(154);
+  mpu.setZAccelOffset(216);
 
   if (mpu.testConnection()) {
     Serial.println("MPU6050 Connected");
@@ -526,54 +529,51 @@ void setup() {
 }
 
 void loop() {
-  // bool dataUpdated = BP32.update();
-  // if (dataUpdated) processControllers();
-  // if(dmp_ready){
-  //   if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
-  //     Quaternion q;
-  //     VectorFloat gravity;
-  //     float ypr[3];
+  bool dataUpdated = BP32.update();
+  if (dataUpdated) processControllers();
+  if(dmp_ready){
+    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+      Quaternion q;
+      VectorFloat gravity;
+      float ypr[3];
 
-  //     mpu.dmpGetQuaternion(&q, fifoBuffer);
-  //     mpu.dmpGetGravity(&gravity, &q);
-  //     mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+      mpu.dmpGetQuaternion(&q, fifoBuffer);
+      mpu.dmpGetGravity(&gravity, &q);
+      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-  //     float robot_angle = ypr[1] * 180/M_PI; // pitch angle
-  //     input = robot_angle;
-  //   }
-  //   dmp_ready = false;
-  // }else{
-  //   pid.Compute();
-  //   // Safety
-  //   if (input > -35 && input < 35){
-  //     if(input < setpoint - deadband){
-  //       // If robot falling backward, move backward
-  //       rightMotor.MoveBackward(abs(output));
-  //       leftMotor.MoveBackward(abs(output));
-  //     }else if(input > setpoint + deadband){
-  //       // If robot fallig forward, move forward
-  //       rightMotor.MoveForward(abs(output));
-  //       leftMotor.MoveForward(abs(output));
-  //     }else{
-  //       rightMotor.MotorStop();
-  //       leftMotor.MotorStop();
-  //       input = 0;
-  //       output =0;
-  //       pid.SetMode(MANUAL);
-  //       pid.SetMode(AUTOMATIC);
-  //     }
-  //   }else{
-  //     rightMotor.MotorStop();
-  //     leftMotor.MotorStop();
-  //     input = 0;
-  //     output =0;
-  //     pid.SetMode(MANUAL);
-  //     pid.SetMode(AUTOMATIC);
-  //   }
-  // }
-
-  leftMotor.MoveForward(2000);
-  rightMotor.MoveForward(2000);
+      float robot_angle = ypr[1] * 180/M_PI; // pitch angle
+      input = robot_angle;
+    }
+    dmp_ready = false;
+  }else{
+    pid.Compute();
+    // Safety
+    if (input > -35 && input < 35){
+      if(input < setpoint - deadband){
+        // If robot falling backward, move backward
+        rightMotor.MoveBackward(abs(output));
+        leftMotor.MoveBackward(abs(output));
+      }else if(input > setpoint + deadband){
+        // If robot fallig forward, move forward
+        rightMotor.MoveForward(abs(output));
+        leftMotor.MoveForward(abs(output));
+      }else{
+        rightMotor.MotorStop();
+        leftMotor.MotorStop();
+        // input = 0;
+        // output =0;
+        // pid.SetMode(MANUAL);
+        // pid.SetMode(AUTOMATIC);
+      }
+    }else{
+      rightMotor.MotorStop();
+      leftMotor.MotorStop();
+      // input = 0;
+      // output =0;
+      // pid.SetMode(MANUAL);
+      // pid.SetMode(AUTOMATIC);
+    }
+  }
 
   // leftMotor.MoveForward(2000);
   // rightMotor.MoveForward(2000);
@@ -584,9 +584,9 @@ void loop() {
   // Serial.print(leftMotor._pid_input);
   // Serial.print("\t");
   // Serial.println(rightMotor._pid_input);
-  Serial.print(leftMotor._pid_input);
-  Serial.print("\t");
-  Serial.println(rightMotor._pid_input);
+  // Serial.print(leftMotor._pid_input);
   // Serial.print("\t");
-  // Serial.println(input);
+  // Serial.println(rightMotor._pid_input);
+  // Serial.print("\t");
+  Serial.println(input);
 }
