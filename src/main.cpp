@@ -24,11 +24,15 @@
 #define RIGHT_ENC_A 34
 #define RIGHT_ENC_B 35
 
+// Task Handle
+TaskHandle_t TaskControlHandle;
+TaskHandle_t TaskRemoteHandle;
+
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 62; //80
-double Ki = 240.2;
-double Kd = 3.6;
+double Kp = 60; //80
+double Ki = 320;
+double Kd = 2.8;
 
 double setpoint = 0;
 float deadband = 0.2;
@@ -443,11 +447,13 @@ void processGamepad(ControllerPtr ctl) {
   //== LEFT JOYSTICK - UP ==//
   if (ctl->axisY() <= -25) {
     // code for when left joystick is pushed up
-    }
+    setpoint = 5; 
+  }
 
   //== LEFT JOYSTICK - DOWN ==//
   if (ctl->axisY() >= 25) {
     // code for when left joystick is pushed down
+    setpoint = -5;
   }
 
   //== LEFT JOYSTICK - LEFT ==//
@@ -463,6 +469,7 @@ void processGamepad(ControllerPtr ctl) {
   //== LEFT JOYSTICK DEADZONE ==//
   if (ctl->axisY() > -25 && ctl->axisY() < 25 && ctl->axisX() > -25 && ctl->axisX() < 25) {
     // code for when left joystick is at idle
+    setpoint = 0;
   }
 
   //== RIGHT JOYSTICK - X AXIS ==//
@@ -488,6 +495,49 @@ void processControllers() {
         Serial.println("Unsupported controller");
       }
     }
+  }
+}
+
+String serialInput = "";
+bool newCommand = false;
+
+void SerialPIDTune() {
+  // Read all available characters without blocking
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      newCommand = true;
+      break;
+    } else {
+      serialInput += c;
+    }
+    
+    // Small delay to allow buffer to fill
+    delay(1);
+  }
+
+  // Process the command if we have a complete one
+  if (newCommand) {
+    serialInput.trim();
+    
+    if (serialInput.startsWith("Kp=")) {
+      Kp = serialInput.substring(3).toFloat();
+      pid.SetTunings(Kp, Ki, Kd);
+      Serial.print("Updated Kp = "); Serial.println(Kp);
+    } 
+    else if (serialInput.startsWith("Ki=")) {
+      Ki = serialInput.substring(3).toFloat();
+      pid.SetTunings(Kp, Ki, Kd);
+      Serial.print("Updated Ki = "); Serial.println(Ki);
+    } 
+    else if (serialInput.startsWith("Kd=")) {
+      Kd = serialInput.substring(3).toFloat();
+      pid.SetTunings(Kp, Ki, Kd);
+      Serial.print("Updated Kd = "); Serial.println(Kd);
+    }
+    
+    serialInput = "";
+    newCommand = false;
   }
 }
 
@@ -543,6 +593,17 @@ void setup() {
 unsigned long lastMillis = 0;
 const unsigned long interval = 10000; // 10 seconds
 long rand_value = 600;
+
+void TaskControl(void *pvParameters){
+  (void) pvParameters;
+  for(;;){
+    
+  }
+}
+
+void TaskRemote(void *pvParameters){
+
+}
 
 void loop() {
   bool dataUpdated = BP32.update();
@@ -611,11 +672,13 @@ void loop() {
   // // Serial.print(leftMotor._pid_input);
   // // Serial.print("\t");
   // // Serial.println(rightMotor._pid_input);
-  // Serial.print(rand_value);
+  // Serial.print(output);
   // Serial.print("\t");
   // Serial.print(leftMotor._pid_input);
   // Serial.print("\t");
-  // Serial.print(rightMotor._pid_input);
+  // Serial.println(rightMotor._pid_input);
+
+  // SerialPIDTune();
   // Serial.print("\t");
   // Serial.println(input);
   // Serial.print("\t");
