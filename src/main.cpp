@@ -26,12 +26,12 @@
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 12; //80
-double Ki = 0;
-double Kd = 1.6;
+double Kp = 62; //80
+double Ki = 240.2;
+double Kd = 3.6;
 
 double setpoint = 0;
-float deadband = 0;
+float deadband = 0.2;
 double input, output;
 volatile bool dmp_ready;
 
@@ -58,6 +58,7 @@ class Motor {
     volatile long enc_count;
     long prevCount = 0;
     unsigned long prevTime = 0;
+    unsigned long lastPidTime = 0;
     bool isEncInterrupt = false;
     float motor_rpm = 0;
     double _pid_input, _pid_output, _pid_setpoint = 0;
@@ -75,15 +76,15 @@ class Motor {
       enc_count = 0;
 
       if(ena_pin == LEFT_MOTOR_ENA){
-        ledcSetup(LEFT_PWM_CHANNEL, 1000, 8);
+        ledcSetup(LEFT_PWM_CHANNEL, 5000, 8); // edit: tambah frekuensi 1000->5000
         ledcAttachPin(ena_pin, LEFT_PWM_CHANNEL);
 
         // Configure PCNT
         pcnt_config_t pcnt_config_left = {
           .pulse_gpio_num = LEFT_ENC_A,
           .ctrl_gpio_num = LEFT_ENC_B,
-          .lctrl_mode = PCNT_MODE_KEEP,
-          .hctrl_mode = PCNT_MODE_REVERSE,
+          .lctrl_mode = PCNT_MODE_REVERSE,   // edit
+          .hctrl_mode = PCNT_MODE_KEEP,
           .pos_mode = PCNT_COUNT_INC,
           .neg_mode = PCNT_COUNT_DEC,
           .counter_h_lim = 32767,
@@ -97,15 +98,15 @@ class Motor {
         pcnt_counter_resume(pcnt_unit_left);
 
       }else if(ena_pin == RIGHT_MOTOR_ENA){
-        ledcSetup(RIGHT_PWM_CHANNEL, 1000, 8);
+        ledcSetup(RIGHT_PWM_CHANNEL, 5000, 8);  // edit frekuensi
         ledcAttachPin(ena_pin, RIGHT_PWM_CHANNEL);
 
         // Configure PCNT
         pcnt_config_t pcnt_config_right = {
           .pulse_gpio_num = RIGHT_ENC_A,
           .ctrl_gpio_num = RIGHT_ENC_B,
-          .lctrl_mode = PCNT_MODE_KEEP,
-          .hctrl_mode = PCNT_MODE_REVERSE,
+          .lctrl_mode = PCNT_MODE_REVERSE,
+          .hctrl_mode = PCNT_MODE_KEEP,
           .pos_mode = PCNT_COUNT_INC,
           .neg_mode = PCNT_COUNT_DEC,
           .counter_h_lim = 32767,
@@ -126,7 +127,7 @@ class Motor {
 
       Motor_pid = new PID(&_pid_input, &_pid_output, &_pid_setpoint, _Kp, _Ki, _Kd, DIRECT);
       Motor_pid->SetMode(AUTOMATIC);
-      Motor_pid->SetSampleTime(50); // 50ms same as encoder pooling rate
+      Motor_pid->SetSampleTime(10); // 50ms same as encoder pooling rate
       Motor_pid->SetOutputLimits(0, 255);
     }
 
@@ -140,11 +141,13 @@ class Motor {
       
       // Read every 50 ms
       unsigned long now = millis();
-      if (now - prevTime >= 50) {
+      unsigned long elapsed = now - prevTime; 
+      if (elapsed >= 10) {
         long delta = count - prevCount;
-        float deltaTime = (now - prevTime) / 1000.0; // in Seconds
+        if (delta > 32767) delta -= 65536;
+        else if (delta < -32767) delta += 65536;
 
-        float rpm = (delta / deltaTime) * 60.0 / 44; // 44 = CPR
+        float rpm = (delta * 60000.0) / (elapsed * 44.0);
         motor_rpm = rpm;
 
         prevCount = count;
@@ -154,19 +157,33 @@ class Motor {
     }
 
     void SetMotorSpeed(float _speed){
-      _pid_setpoint = _speed;
-      _pid_input = abs(ReadMotorSpeed());
-      Motor_pid->Compute();
-      int pwm_output = (int)_pid_output;
-      pwm_output = constrain(pwm_output, 0, 255);
+      _pid_setpoint = abs(_speed);
+      
+      // Only compute PID at appropriate intervals
+      unsigned long now = millis();
+      if (now - lastPidTime >= 10) { // Match PID sample time
+        _pid_input = abs(ReadMotorSpeed());
+        Motor_pid->Compute();
+        lastPidTime = now;
+      }
 
-      if (_ena_pin == LEFT_MOTOR_ENA)
+      int pwm_output = constrain((int)_pid_output, 0, 255);
+      
+      if (_ena_pin == LEFT_MOTOR_ENA) {
         ledcWrite(LEFT_PWM_CHANNEL, uint8_t(pwm_output));
-      else if (_ena_pin == RIGHT_MOTOR_ENA)
+      } else if (_ena_pin == RIGHT_MOTOR_ENA) {
         ledcWrite(RIGHT_PWM_CHANNEL, uint8_t(pwm_output));
+      }
+      if (_speed > 0) {
+        MoveBackward();
+      } else if (_speed < 0) {
+        MoveForward();
+      } else {
+        MotorStop();
+      }
     }
 
-    void MoveForward(float _speed){
+    void MoveForward(){
       if (_isReversed) {
         digitalWrite(_in1_pin, LOW);
         digitalWrite(_in2_pin, HIGH);
@@ -174,10 +191,9 @@ class Motor {
         digitalWrite(_in1_pin, HIGH);
         digitalWrite(_in2_pin, LOW);
       }
-      SetMotorSpeed(_speed);
     }
 
-    void MoveBackward(float _speed){
+    void MoveBackward(){
       if (_isReversed) {
         digitalWrite(_in1_pin, HIGH);
         digitalWrite(_in2_pin, LOW);
@@ -185,23 +201,19 @@ class Motor {
         digitalWrite(_in1_pin, LOW);
         digitalWrite(_in2_pin, HIGH);
       }
-      SetMotorSpeed(_speed);
     }
 
     void MotorStop(){
+      digitalWrite(_in1_pin, LOW);
+      digitalWrite(_in2_pin, LOW);
+
       if (_ena_pin == LEFT_MOTOR_ENA)
         ledcWrite(LEFT_PWM_CHANNEL, 0);
       else if (_ena_pin == RIGHT_MOTOR_ENA)
         ledcWrite(RIGHT_PWM_CHANNEL, 0);
-
-      digitalWrite(_in1_pin, LOW);
-      digitalWrite(_in2_pin, LOW);
-
-      _pid_input = 0;
-      _pid_output = 0;
-      enc_count = 0;
-
+      
       Motor_pid->SetMode(MANUAL);
+      _pid_output = 0;
       Motor_pid->SetMode(AUTOMATIC);
     }
 
@@ -522,11 +534,15 @@ void setup() {
 
   pid.SetMode(AUTOMATIC);
   pid.SetSampleTime(10);
-  pid.SetOutputLimits(-5000, 5000); // Max Motor Speed
+  pid.SetOutputLimits(-2200, 2200); // Max Motor Speed
 
-  rightMotor.SetKpid(0.14, 0.64, 0.018);
-  leftMotor.SetKpid(0.14, 0.64, 0.018);
+  rightMotor.SetKpid(0.14, 0.8, 0.002);
+  leftMotor.SetKpid(0.14, 0.8, 0.002);
 }
+
+unsigned long lastMillis = 0;
+const unsigned long interval = 10000; // 10 seconds
+long rand_value = 600;
 
 void loop() {
   bool dataUpdated = BP32.update();
@@ -548,15 +564,15 @@ void loop() {
   }else{
     pid.Compute();
     // Safety
-    if (input > -35 && input < 35){
+    if (input > -50 && input < 50){
       if(input < setpoint - deadband){
         // If robot falling backward, move backward
-        rightMotor.MoveBackward(abs(output));
-        leftMotor.MoveBackward(abs(output));
+        rightMotor.SetMotorSpeed(output);
+        leftMotor.SetMotorSpeed(output);
       }else if(input > setpoint + deadband){
         // If robot fallig forward, move forward
-        rightMotor.MoveForward(abs(output));
-        leftMotor.MoveForward(abs(output));
+        rightMotor.SetMotorSpeed(output);
+        leftMotor.SetMotorSpeed(output);
       }else{
         rightMotor.MotorStop();
         leftMotor.MotorStop();
@@ -575,18 +591,33 @@ void loop() {
     }
   }
 
-  // leftMotor.MoveForward(2000);
-  // rightMotor.MoveForward(2000);
-  // For diagnostis using serial plotter
-  // Serial.print(leftMotor.ReadMotorSpeed());
+  // unsigned long now = millis();
+
+  // if (now - lastMillis >= interval) {
+  //   lastMillis = now;
+    
+  //   // Generate random number between 0 and 5000
+  //   rand_value = random(0, 2000); // upper bound is exclusive
+    
+  //   Serial.println(rand_value);
+  // }
+
+  // leftMotor.SetMotorSpeed(rand_value);
+  // rightMotor.SetMotorSpeed(rand_value);
+  // // For diagnostis using serial plotter
+  // // Serial.print(leftMotor.ReadMotorSpeed());
+  // // Serial.print("\t");
+  // // Serial.println(rightMotor.ReadMotorSpeed());
+  // // Serial.print(leftMotor._pid_input);
+  // // Serial.print("\t");
+  // // Serial.println(rightMotor._pid_input);
+  // Serial.print(rand_value);
   // Serial.print("\t");
-  // Serial.println(rightMotor.ReadMotorSpeed());
   // Serial.print(leftMotor._pid_input);
   // Serial.print("\t");
-  // Serial.println(rightMotor._pid_input);
-  // Serial.print(leftMotor._pid_input);
+  // Serial.print(rightMotor._pid_input);
   // Serial.print("\t");
-  // Serial.println(rightMotor._pid_input);
+  // Serial.println(input);
   // Serial.print("\t");
-  Serial.println(input);
+  // Serial.println(rand_value);
 }
