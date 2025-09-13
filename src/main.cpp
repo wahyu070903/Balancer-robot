@@ -3,6 +3,9 @@
 #include <PID_v1.h>
 #include <Bluepad32.h>
 #include "driver/pcnt.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 #define IMU_SCL 22
 #define IMU_SDA 21
@@ -27,17 +30,31 @@
 // Task Handle
 TaskHandle_t TaskControlHandle;
 TaskHandle_t TaskRemoteHandle;
+void TaskControl(void *pvParameters);
+void TaskRemote(void *pvParameters);
+
+// MUtex variable
+SemaphoreHandle_t imuDataMutex;
+SemaphoreHandle_t pidDataMutex;
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
 double Kp = 60; //80
-double Ki = 320;
-double Kd = 2.8;
+double Ki = 2.8;
+double Kd = 280;
+
+double Kp_orient = 60; //80
+double Ki_orient = 2.8;
+double Kd_orient = 280;
 
 double setpoint = 0;
 float deadband = 0.2;
 double input, output;
 volatile bool dmp_ready;
+double orientation = 0;
+double target_orient = 0;
+double output_orient = 0;
+bool init_orient = false;
 
 uint16_t packetSize;
 uint16_t fifoCount;
@@ -47,6 +64,7 @@ pcnt_unit_t pcnt_unit_left = PCNT_UNIT_0;
 pcnt_unit_t pcnt_unit_right = PCNT_UNIT_1;
 
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+PID pid_orient(&orientation, &output_orient, &target_orient, Kp_orient, Ki_orient, Kd_orient, DIRECT);
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 MPU6050 mpu;
 
@@ -179,9 +197,9 @@ class Motor {
         ledcWrite(RIGHT_PWM_CHANNEL, uint8_t(pwm_output));
       }
       if (_speed > 0) {
-        MoveBackward();
-      } else if (_speed < 0) {
         MoveForward();
+      } else if (_speed < 0) {
+        MoveBackward();
       } else {
         MotorStop();
       }
@@ -253,8 +271,8 @@ class Motor {
     }
 };
 
-Motor leftMotor(true, LEFT_MOTOR_ENA, LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, LEFT_ENC_A, LEFT_ENC_B);
-Motor rightMotor(false, RIGHT_MOTOR_ENA, RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, RIGHT_ENC_A, RIGHT_ENC_B);
+Motor leftMotor(false, LEFT_MOTOR_ENA, LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, LEFT_ENC_A, LEFT_ENC_B);
+Motor rightMotor(true, RIGHT_MOTOR_ENA, RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, RIGHT_ENC_A, RIGHT_ENC_B);
 
 // uint8_t* setMotorMoveRatio(uint8_t _ma_ratio, uint8_t _mb_ratio, uint8_t _speed, Motor& rightMotor, Motor& leftMotor) {
 //   static uint8_t motor_speed[2] = {0, 0};
@@ -542,6 +560,31 @@ void SerialPIDTune() {
 }
 
 void setup() {
+  // Mutex init
+  imuDataMutex = xSemaphoreCreateMutex();
+  pidDataMutex = xSemaphoreCreateMutex();
+  
+  // Task init
+  xTaskCreatePinnedToCore(
+    TaskControl,         
+    "TaskControl",       
+    4096,                
+    NULL,          
+    2,                   
+    &TaskControlHandle,  
+    1                    // Core 1
+  );
+
+  xTaskCreatePinnedToCore(
+    TaskRemote,
+    "TaskRemote",
+    4096,
+    NULL,
+    1,                 
+    &TaskRemoteHandle,
+    0                    // Core 0
+  );
+
   Serial.begin(115200);
   Wire.begin(IMU_SDA, IMU_SCL);
 
@@ -586,101 +629,98 @@ void setup() {
   pid.SetSampleTime(10);
   pid.SetOutputLimits(-2200, 2200); // Max Motor Speed
 
+  pid_orient.SetMode(AUTOMATIC);
+  pid_orient.SetSampleTime(10);
+  pid_orient.SetOutputLimits(-1500, 1500);
+
   rightMotor.SetKpid(0.14, 0.8, 0.002);
   leftMotor.SetKpid(0.14, 0.8, 0.002);
 }
 
-unsigned long lastMillis = 0;
-const unsigned long interval = 10000; // 10 seconds
-long rand_value = 600;
-
 void TaskControl(void *pvParameters){
   (void) pvParameters;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = 5 / portTICK_PERIOD_MS; // 200 Hz
+  
   for(;;){
-    
+    xTaskDelayUntil(&xLastWakeTime, xFrequency);
+    if(dmp_ready){
+      if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+        Quaternion q;
+        VectorFloat gravity;
+        float ypr[3];
+
+        mpu.dmpGetQuaternion(&q, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+        float robot_angle = ypr[1] * 180/M_PI; // pitch
+        orientation = ypr[0] * 180/M_PI;
+
+        input = robot_angle;
+        if(init_orient == false){
+          target_orient = orientation;
+          init_orient = true;
+        }
+      }
+      dmp_ready = false;
+    }else{
+      pid.Compute();
+      pid_orient.Compute();
+      if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
+        if (input > -50 && input < 50){
+          if(input < setpoint - deadband){
+            // If robot falling backward, move backward
+            rightMotor.SetMotorSpeed(output);
+            leftMotor.SetMotorSpeed(output);
+          }else if(input > setpoint + deadband){
+            // If robot fallig forward, move forward
+            rightMotor.SetMotorSpeed(output);
+            leftMotor.SetMotorSpeed(output);
+          }else{
+            rightMotor.MotorStop();
+            leftMotor.MotorStop();
+          }
+          // Orientation correction
+          if(orientation > target_orient - deadband){
+            rightMotor.SetMotorSpeed(output_orient);
+            leftMotor.SetMotorSpeed(-output_orient);
+          }else if(orientation < target_orient - deadband){
+            rightMotor.SetMotorSpeed(-output_orient);
+            leftMotor.SetMotorSpeed(output_orient);
+          }
+        }else{
+          rightMotor.MotorStop();
+          leftMotor.MotorStop();
+          // Reset orientation after fall
+          init_orient = false;
+        }
+
+        xSemaphoreGive(pidDataMutex);
+      }
+    }
+
+    // Serial debugging here
+    Serial.print(target_orient);
+    Serial.print(",");
+    Serial.println(orientation);
   }
 }
 
 void TaskRemote(void *pvParameters){
+  (void) pvParameters;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = 10 / portTICK_PERIOD_MS; // 100 Hz
 
+  for(;;){
+    xTaskDelayUntil(&xLastWakeTime, xFrequency);
+    
+    bool dataUpdated = BP32.update();
+    if (dataUpdated) processControllers();
+    SerialPIDTune(); 
+  } 
 }
 
 void loop() {
-  bool dataUpdated = BP32.update();
-  if (dataUpdated) processControllers();
-  if(dmp_ready){
-    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
-      Quaternion q;
-      VectorFloat gravity;
-      float ypr[3];
-
-      mpu.dmpGetQuaternion(&q, fifoBuffer);
-      mpu.dmpGetGravity(&gravity, &q);
-      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-
-      float robot_angle = ypr[1] * 180/M_PI; // pitch angle
-      input = robot_angle;
-    }
-    dmp_ready = false;
-  }else{
-    pid.Compute();
-    // Safety
-    if (input > -50 && input < 50){
-      if(input < setpoint - deadband){
-        // If robot falling backward, move backward
-        rightMotor.SetMotorSpeed(output);
-        leftMotor.SetMotorSpeed(output);
-      }else if(input > setpoint + deadband){
-        // If robot fallig forward, move forward
-        rightMotor.SetMotorSpeed(output);
-        leftMotor.SetMotorSpeed(output);
-      }else{
-        rightMotor.MotorStop();
-        leftMotor.MotorStop();
-        // input = 0;
-        // output =0;
-        // pid.SetMode(MANUAL);
-        // pid.SetMode(AUTOMATIC);
-      }
-    }else{
-      rightMotor.MotorStop();
-      leftMotor.MotorStop();
-      // input = 0;
-      // output =0;
-      // pid.SetMode(MANUAL);
-      // pid.SetMode(AUTOMATIC);
-    }
-  }
-
-  // unsigned long now = millis();
-
-  // if (now - lastMillis >= interval) {
-  //   lastMillis = now;
-    
-  //   // Generate random number between 0 and 5000
-  //   rand_value = random(0, 2000); // upper bound is exclusive
-    
-  //   Serial.println(rand_value);
-  // }
-
-  // leftMotor.SetMotorSpeed(rand_value);
-  // rightMotor.SetMotorSpeed(rand_value);
-  // // For diagnostis using serial plotter
-  // // Serial.print(leftMotor.ReadMotorSpeed());
-  // // Serial.print("\t");
-  // // Serial.println(rightMotor.ReadMotorSpeed());
-  // // Serial.print(leftMotor._pid_input);
-  // // Serial.print("\t");
-  // // Serial.println(rightMotor._pid_input);
-  // Serial.print(output);
-  // Serial.print("\t");
-  // Serial.print(leftMotor._pid_input);
-  // Serial.print("\t");
-  // Serial.println(rightMotor._pid_input);
-
-  // SerialPIDTune();
-  // Serial.print("\t");
-  // Serial.println(input);
-  // Serial.print("\t");
-  // Serial.println(rand_value);
+  vTaskDelay(portMAX_DELAY); 
 }
