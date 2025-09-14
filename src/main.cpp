@@ -39,22 +39,23 @@ SemaphoreHandle_t pidDataMutex;
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 60; //80
-double Ki = 2.8;
-double Kd = 280;
+double Kp = 42; //80
+double Ki = 280;
+double Kd = 2.0;
 
-double Kp_orient = 60; //80
-double Ki_orient = 2.8;
-double Kd_orient = 280;
+double Kp_orient = 0; //80
+double Ki_orient = 0;
+double Kd_orient = 0;
 
 double setpoint = 0;
-float deadband = 0.2;
+float deadband = 0;
 double input, output;
 volatile bool dmp_ready;
 double orientation = 0;
 double target_orient = 0;
 double output_orient = 0;
 bool init_orient = false;
+uint8_t serial_tuneOpt = 0;
 
 uint16_t packetSize;
 uint16_t fifoCount;
@@ -538,20 +539,43 @@ void SerialPIDTune() {
   if (newCommand) {
     serialInput.trim();
     
+    if(serialInput.startsWith("Orient")){
+      serial_tuneOpt = 100;
+    }else if(serialInput.startsWith("Balance")){
+      serial_tuneOpt = 101;
+    }
     if (serialInput.startsWith("Kp=")) {
-      Kp = serialInput.substring(3).toFloat();
-      pid.SetTunings(Kp, Ki, Kd);
-      Serial.print("Updated Kp = "); Serial.println(Kp);
+      if(serial_tuneOpt == 101){
+        Kp = serialInput.substring(3).toFloat();
+        pid.SetTunings(Kp, Ki, Kd);
+        Serial.print("Updated Kp = "); Serial.println(Kp);
+      }else if (serial_tuneOpt == 100){
+        Kp_orient = serialInput.substring(3).toFloat();
+        pid_orient.SetTunings(Kp_orient, Ki_orient, Kd_orient);
+        Serial.print("Updated Kp = "); Serial.println(Kp_orient);
+      }
     } 
     else if (serialInput.startsWith("Ki=")) {
-      Ki = serialInput.substring(3).toFloat();
-      pid.SetTunings(Kp, Ki, Kd);
-      Serial.print("Updated Ki = "); Serial.println(Ki);
+      if(serial_tuneOpt == 101){
+        Ki = serialInput.substring(3).toFloat();
+        pid.SetTunings(Kp, Ki, Kd);
+        Serial.print("Updated Ki = "); Serial.println(Ki);
+      }else if (serial_tuneOpt == 100){
+        Ki_orient = serialInput.substring(3).toFloat();
+        pid_orient.SetTunings(Kp_orient, Ki_orient, Kd_orient);
+        Serial.print("Updated Ki = "); Serial.println(Ki_orient);
+      }
     } 
     else if (serialInput.startsWith("Kd=")) {
-      Kd = serialInput.substring(3).toFloat();
-      pid.SetTunings(Kp, Ki, Kd);
-      Serial.print("Updated Kd = "); Serial.println(Kd);
+      if(serial_tuneOpt == 101){
+        Kd = serialInput.substring(3).toFloat();
+        pid.SetTunings(Kp, Ki, Kd);
+        Serial.print("Updated Kd = "); Serial.println(Kd);
+      }else if (serial_tuneOpt == 100){
+        Kd_orient = serialInput.substring(3).toFloat();
+        pid_orient.SetTunings(Kp_orient, Ki_orient, Kd_orient);
+        Serial.print("Updated Kd = "); Serial.println(Kd_orient);
+      }
     }
     
     serialInput = "";
@@ -641,7 +665,7 @@ void TaskControl(void *pvParameters){
   (void) pvParameters;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = 5 / portTICK_PERIOD_MS; // 200 Hz
-  
+  double lastLog = 0;
   for(;;){
     xTaskDelayUntil(&xLastWakeTime, xFrequency);
     if(dmp_ready){
@@ -669,26 +693,16 @@ void TaskControl(void *pvParameters){
       pid_orient.Compute();
       if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
         if (input > -50 && input < 50){
-          if(input < setpoint - deadband){
-            // If robot falling backward, move backward
-            rightMotor.SetMotorSpeed(output);
-            leftMotor.SetMotorSpeed(output);
-          }else if(input > setpoint + deadband){
-            // If robot fallig forward, move forward
-            rightMotor.SetMotorSpeed(output);
-            leftMotor.SetMotorSpeed(output);
-          }else{
-            rightMotor.MotorStop();
-            leftMotor.MotorStop();
+          float left_speed = output;
+          float right_speed = output;
+
+          if (fabs(orientation - target_orient) > deadband) {
+            left_speed += output_orient;
+            right_speed -= output_orient;
           }
-          // Orientation correction
-          if(orientation > target_orient - deadband){
-            rightMotor.SetMotorSpeed(output_orient);
-            leftMotor.SetMotorSpeed(-output_orient);
-          }else if(orientation < target_orient - deadband){
-            rightMotor.SetMotorSpeed(-output_orient);
-            leftMotor.SetMotorSpeed(output_orient);
-          }
+          rightMotor.SetMotorSpeed(right_speed);
+          leftMotor.SetMotorSpeed(left_speed);
+
         }else{
           rightMotor.MotorStop();
           leftMotor.MotorStop();
@@ -701,9 +715,14 @@ void TaskControl(void *pvParameters){
     }
 
     // Serial debugging here
+    // Serial.print(setpoint);
+    // Serial.print(",");
+    // Serial.println(input);
+    
     Serial.print(target_orient);
     Serial.print(",");
     Serial.println(orientation);
+
   }
 }
 
