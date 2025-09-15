@@ -2,6 +2,7 @@
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <PID_v1.h>
 #include <Bluepad32.h>
+#include <ESP32Servo.h>
 #include "driver/pcnt.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -21,11 +22,18 @@
 #define LEFT_MOTOR_IN1 14
 #define LEFT_MOTOR_IN2 15
 
-// Cek GPIO
 #define LEFT_ENC_A 32
 #define LEFT_ENC_B 33
 #define RIGHT_ENC_A 34
 #define RIGHT_ENC_B 35
+
+#define LED_1 5
+#define LED_2 19
+#define LED_3 23
+
+#define SERVO_1 16
+#define SERVO_2 17
+#define SERVO_3 18
 
 // Task Handle
 TaskHandle_t TaskControlHandle;
@@ -39,16 +47,16 @@ SemaphoreHandle_t pidDataMutex;
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 42; //80
-double Ki = 280;
-double Kd = 2.0;
+double Kp = 1; //80
+double Ki = 0;
+double Kd = 0;
 
-double Kp_orient = 0; //80
-double Ki_orient = 0;
-double Kd_orient = 0;
+double Kp_orient = 0; //1.2
+double Ki_orient = 0; // 6.4
+double Kd_orient = 0; //0.528
 
 double setpoint = 0;
-float deadband = 0;
+float deadband = 2;
 double input, output;
 volatile bool dmp_ready;
 double orientation = 0;
@@ -56,6 +64,8 @@ double target_orient = 0;
 double output_orient = 0;
 bool init_orient = false;
 uint8_t serial_tuneOpt = 0;
+bool isRemoteConnected = false;
+bool isRobotFall = false;
 
 uint16_t packetSize;
 uint16_t fifoCount;
@@ -99,7 +109,7 @@ class Motor {
       enc_count = 0;
 
       if(ena_pin == LEFT_MOTOR_ENA){
-        ledcSetup(LEFT_PWM_CHANNEL, 5000, 8); // edit: tambah frekuensi 1000->5000
+        ledcSetup(LEFT_PWM_CHANNEL, 25000, 10); // edit: tambah frekuensi 1000->5000
         ledcAttachPin(ena_pin, LEFT_PWM_CHANNEL);
 
         // Configure PCNT
@@ -121,7 +131,7 @@ class Motor {
         pcnt_counter_resume(pcnt_unit_left);
 
       }else if(ena_pin == RIGHT_MOTOR_ENA){
-        ledcSetup(RIGHT_PWM_CHANNEL, 5000, 8);  // edit frekuensi
+        ledcSetup(RIGHT_PWM_CHANNEL, 25000, 10);  // edit frekuensi
         ledcAttachPin(ena_pin, RIGHT_PWM_CHANNEL);
 
         // Configure PCNT
@@ -151,7 +161,7 @@ class Motor {
       Motor_pid = new PID(&_pid_input, &_pid_output, &_pid_setpoint, _Kp, _Ki, _Kd, DIRECT);
       Motor_pid->SetMode(AUTOMATIC);
       Motor_pid->SetSampleTime(10); // 50ms same as encoder pooling rate
-      Motor_pid->SetOutputLimits(0, 255);
+      Motor_pid->SetOutputLimits(0, 1023);
     }
 
     float ReadMotorSpeed(){
@@ -275,6 +285,41 @@ class Motor {
 Motor leftMotor(false, LEFT_MOTOR_ENA, LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, LEFT_ENC_A, LEFT_ENC_B);
 Motor rightMotor(true, RIGHT_MOTOR_ENA, RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, RIGHT_ENC_A, RIGHT_ENC_B);
 
+class LedRuntime {
+  public:
+    uint8_t led = 0;
+    long lastFlashing = 0;
+    bool lastState = false;
+
+    LedRuntime(uint8_t _gpio){
+      this->led = _gpio;
+      pinMode(this->led, OUTPUT);
+    }
+    void TurnOn(){
+      digitalWrite(this->led, HIGH);
+    }
+    void TurnOFF(){
+      digitalWrite(this->led, LOW);
+    }
+    void FlashingLed(unsigned long _period){
+      unsigned long now = millis();
+      if (now - lastFlashing >= _period) {
+        lastFlashing = now;
+        lastState = !lastState;
+        digitalWrite(this->led, lastState ? HIGH : LOW);
+      }
+    }
+};
+
+LedRuntime Led_1(LED_1);
+LedRuntime Led_2(LED_2);
+LedRuntime Led_3(LED_3);
+
+// Servo object
+Servo Servo_1;
+Servo Servo_2;
+Servo Servo_3;
+
 // uint8_t* setMotorMoveRatio(uint8_t _ma_ratio, uint8_t _mb_ratio, uint8_t _speed, Motor& rightMotor, Motor& leftMotor) {
 //   static uint8_t motor_speed[2] = {0, 0};
 
@@ -317,6 +362,7 @@ void onConnectedController(ControllerPtr ctl) {
     if (!foundEmptySlot) {
       Serial.println("CALLBACK: Controller connected, but could not found empty slot");
     }
+  isRemoteConnected = true;
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
@@ -334,6 +380,7 @@ void onDisconnectedController(ControllerPtr ctl) {
     if (!foundController) {
       Serial.println("CALLBACK: Controller disconnected, but not found in myControllers");
     }
+  isRemoteConnected = false;
 }
 
 // Dump all values to serial monitor (Debuging Only)
@@ -466,13 +513,13 @@ void processGamepad(ControllerPtr ctl) {
   //== LEFT JOYSTICK - UP ==//
   if (ctl->axisY() <= -25) {
     // code for when left joystick is pushed up
-    setpoint = 5; 
+    setpoint = 2; 
   }
 
   //== LEFT JOYSTICK - DOWN ==//
   if (ctl->axisY() >= 25) {
     // code for when left joystick is pushed down
-    setpoint = -5;
+    setpoint = -2;
   }
 
   //== LEFT JOYSTICK - LEFT ==//
@@ -494,6 +541,7 @@ void processGamepad(ControllerPtr ctl) {
   //== RIGHT JOYSTICK - X AXIS ==//
   if (ctl->axisRX()) {
     // code for when right joystick moves along x-axis
+    
   }
 
   //== RIGHT JOYSTICK - Y AXIS ==//
@@ -583,6 +631,17 @@ void SerialPIDTune() {
   }
 }
 
+float NormalizeYawAngle(float angle){
+  while (angle > 180.0) angle -= 360.0;
+  while (angle < -180.0) angle += 360.0;
+  return angle;
+}
+
+float YawAngleDifferece(float a, float b){
+  float diff = a - b;
+  return NormalizeYawAngle(diff);
+}
+
 void setup() {
   // Mutex init
   imuDataMutex = xSemaphoreCreateMutex();
@@ -611,6 +670,7 @@ void setup() {
 
   Serial.begin(115200);
   Wire.begin(IMU_SDA, IMU_SCL);
+  isRemoteConnected = false;
 
   Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
   const uint8_t* addr = BP32.localBdAddress();
@@ -659,6 +719,10 @@ void setup() {
 
   rightMotor.SetKpid(0.14, 0.8, 0.002);
   leftMotor.SetKpid(0.14, 0.8, 0.002);
+
+  Servo_1.attach(SERVO_1);
+  Servo_2.attach(SERVO_2);
+  Servo_3.attach(SERVO_3);
 }
 
 void TaskControl(void *pvParameters){
@@ -693,21 +757,28 @@ void TaskControl(void *pvParameters){
       pid_orient.Compute();
       if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
         if (input > -50 && input < 50){
+          isRobotFall = false;
           float left_speed = output;
           float right_speed = output;
 
-          if (fabs(orientation - target_orient) > deadband) {
-            left_speed += output_orient;
-            right_speed -= output_orient;
+          float orient_error = YawAngleDifferece(target_orient, orientation);
+          if(fabs(orient_error) > deadband){
+            if(orient_error > 0){
+              left_speed -= output_orient;
+              right_speed += output_orient;
+            }else{
+              left_speed += output_orient;
+              right_speed -= output_orient;
+            }
           }
           rightMotor.SetMotorSpeed(right_speed);
           leftMotor.SetMotorSpeed(left_speed);
-
         }else{
           rightMotor.MotorStop();
           leftMotor.MotorStop();
           // Reset orientation after fall
           init_orient = false;
+          isRobotFall = true;
         }
 
         xSemaphoreGive(pidDataMutex);
@@ -715,13 +786,15 @@ void TaskControl(void *pvParameters){
     }
 
     // Serial debugging here
-    // Serial.print(setpoint);
-    // Serial.print(",");
-    // Serial.println(input);
-    
-    Serial.print(target_orient);
+    Serial.print(millis());
     Serial.print(",");
-    Serial.println(orientation);
+    Serial.print(setpoint);
+    Serial.print(",");  
+    Serial.println(input);
+    
+    // Serial.print(target_orient);
+    // Serial.print(",");
+    // Serial.println(orientation);
 
   }
 }
@@ -736,6 +809,21 @@ void TaskRemote(void *pvParameters){
     
     bool dataUpdated = BP32.update();
     if (dataUpdated) processControllers();
+
+    if(isRobotFall){
+      Led_1.FlashingLed(200);
+      Led_2.FlashingLed(250);
+      Led_3.FlashingLed(300);
+    }else{
+      Led_1.TurnOFF();
+      Led_2.TurnOFF();
+      Led_3.TurnOFF();
+      if(isRemoteConnected){
+        Led_1.TurnOn();
+      }else{
+        Led_1.FlashingLed(200);
+      }
+    }
     SerialPIDTune(); 
   } 
 }
