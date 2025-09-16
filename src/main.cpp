@@ -47,9 +47,9 @@ SemaphoreHandle_t pidDataMutex;
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 1; //80
-double Ki = 0;
-double Kd = 0;
+double Kp = 40; //80
+double Ki = 160;
+double Kd = 3;
 
 double Kp_orient = 0; //1.2
 double Ki_orient = 0; // 6.4
@@ -109,7 +109,7 @@ class Motor {
       enc_count = 0;
 
       if(ena_pin == LEFT_MOTOR_ENA){
-        ledcSetup(LEFT_PWM_CHANNEL, 25000, 10); // edit: tambah frekuensi 1000->5000
+        ledcSetup(LEFT_PWM_CHANNEL, 5000, 8); // edit: tambah frekuensi 1000->5000
         ledcAttachPin(ena_pin, LEFT_PWM_CHANNEL);
 
         // Configure PCNT
@@ -131,7 +131,7 @@ class Motor {
         pcnt_counter_resume(pcnt_unit_left);
 
       }else if(ena_pin == RIGHT_MOTOR_ENA){
-        ledcSetup(RIGHT_PWM_CHANNEL, 25000, 10);  // edit frekuensi
+        ledcSetup(RIGHT_PWM_CHANNEL, 5000, 8);  // edit frekuensi
         ledcAttachPin(ena_pin, RIGHT_PWM_CHANNEL);
 
         // Configure PCNT
@@ -200,7 +200,7 @@ class Motor {
         lastPidTime = now;
       }
 
-      int pwm_output = constrain((int)_pid_output, 0, 255);
+      int pwm_output = constrain((int)_pid_output, 0, 1023);
       
       if (_ena_pin == LEFT_MOTOR_ENA) {
         ledcWrite(LEFT_PWM_CHANNEL, uint8_t(pwm_output));
@@ -785,13 +785,21 @@ void TaskControl(void *pvParameters){
       }
     }
 
+    // rightMotor.SetMotorSpeed(1500);
+    // leftMotor.SetMotorSpeed(1500);
     // Serial debugging here
+    // Serial.print(millis());
+    // Serial.print(",");
+    // Serial.print(rightMotor._pid_input);
+    // Serial.print(",");
+    // Serial.println(leftMotor._pid_input);
+    
     Serial.print(millis());
     Serial.print(",");
     Serial.print(setpoint);
-    Serial.print(",");  
+    Serial.print(",");
     Serial.println(input);
-    
+
     // Serial.print(target_orient);
     // Serial.print(",");
     // Serial.println(orientation);
