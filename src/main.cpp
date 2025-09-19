@@ -12,28 +12,25 @@
 #define IMU_SDA 21
 #define IMU_INT 27
 
-#define LEFT_PWM_CHANNEL 0
-#define RIGHT_PWM_CHANNEL 1
+#define RIGHT_PWM_CHANNEL_R 2
+#define RIGHT_PWM_CHANNEL_L 3
+#define LEFT_PWM_CHANNEL_R 4
+#define LEFT_PWM_CHANNEL_L 5
 
-#define RIGHT_MOTOR_ENA 2
-#define RIGHT_MOTOR_IN1 12
-#define RIGHT_MOTOR_IN2 13
-#define LEFT_MOTOR_ENA 4
-#define LEFT_MOTOR_IN1 14
-#define LEFT_MOTOR_IN2 15
+#define RIGHT_MOTOR_RPWM 4
+#define RIGHT_MOTOR_LPWM 2
+#define LEFT_MOTOR_RPWM 5
+#define LEFT_MOTOR_LPWM 19
 
-#define LEFT_ENC_A 32
-#define LEFT_ENC_B 33
-#define RIGHT_ENC_A 34
-#define RIGHT_ENC_B 35
+#define LEFT_ENC_A 34
+#define LEFT_ENC_B 35
+#define RIGHT_ENC_A 32
+#define RIGHT_ENC_B 33
 
-#define LED_1 5
-#define LED_2 19
-#define LED_3 23
+#define LED_1 23
 
 #define SERVO_1 16
 #define SERVO_2 17
-#define SERVO_3 18
 
 // Task Handle
 TaskHandle_t TaskControlHandle;
@@ -47,9 +44,9 @@ SemaphoreHandle_t pidDataMutex;
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 40; //80
-double Ki = 160;
-double Kd = 3;
+double Kp = 10; //80
+double Ki = 0;
+double Kd = 0;
 
 double Kp_orient = 0; //1.2
 double Ki_orient = 0; // 6.4
@@ -79,6 +76,9 @@ PID pid_orient(&orientation, &output_orient, &target_orient, Kp_orient, Ki_orien
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 MPU6050 mpu;
 
+void ServoMoveUp();
+void ServoMoveDown();
+
 void IRAM_ATTR dmpDataReady() {
   dmp_ready = true;
 }
@@ -86,7 +86,8 @@ void IRAM_ATTR dmpDataReady() {
 class Motor {
   public:
     bool _isReversed = false;
-    uint8_t _ena_pin, _in1_pin, _in2_pin;
+    uint8_t _rpwm_pin, _lpwm_pin;
+    uint8_t _rpwm_channel = 0, _lpwm_channel = 0;
     uint8_t _enc_a_pin, _enc_b_pin;
     volatile long enc_count;
     long prevCount = 0;
@@ -98,24 +99,27 @@ class Motor {
     double _Kp = 0, _Ki = 0, _Kd = 0;
     PID* Motor_pid;
 
-    Motor(bool reversed, uint8_t ena_pin, uint8_t in1_pin, uint8_t in2_pin, uint8_t enc_a_pin, uint8_t enc_b_pin) {
+    Motor(bool reversed, uint8_t rpwm_pin, uint8_t lpwm_pin, uint8_t enc_a_pin, uint8_t enc_b_pin) {
       _isReversed = reversed;
-      _ena_pin = ena_pin;
-      _in1_pin = in1_pin;
-      _in2_pin = in2_pin;
+      _rpwm_pin = rpwm_pin;
+      _lpwm_pin = lpwm_pin;
       _enc_a_pin = enc_a_pin;
       _enc_b_pin = enc_b_pin;  
       // Reset value on startup
       enc_count = 0;
 
-      if(ena_pin == LEFT_MOTOR_ENA){
-        ledcSetup(LEFT_PWM_CHANNEL, 5000, 8); // edit: tambah frekuensi 1000->5000
-        ledcAttachPin(ena_pin, LEFT_PWM_CHANNEL);
+      if(_rpwm_pin == LEFT_MOTOR_RPWM){
+        ledcSetup(LEFT_PWM_CHANNEL_R, 5000, 8); // edit: tambah frekuensi 1000->5000
+        ledcSetup(LEFT_PWM_CHANNEL_L, 5000, 8);
+        ledcAttachPin(_rpwm_pin, LEFT_PWM_CHANNEL_R);
+        ledcAttachPin(_lpwm_pin, LEFT_PWM_CHANNEL_L);
+        _rpwm_channel = LEFT_PWM_CHANNEL_R;
+        _lpwm_channel = LEFT_PWM_CHANNEL_L;
 
         // Configure PCNT
         pcnt_config_t pcnt_config_left = {
-          .pulse_gpio_num = LEFT_ENC_A,
-          .ctrl_gpio_num = LEFT_ENC_B,
+          .pulse_gpio_num = _enc_a_pin,
+          .ctrl_gpio_num = _enc_b_pin,
           .lctrl_mode = PCNT_MODE_REVERSE,   // edit
           .hctrl_mode = PCNT_MODE_KEEP,
           .pos_mode = PCNT_COUNT_INC,
@@ -130,14 +134,18 @@ class Motor {
         pcnt_counter_clear(pcnt_unit_left);
         pcnt_counter_resume(pcnt_unit_left);
 
-      }else if(ena_pin == RIGHT_MOTOR_ENA){
-        ledcSetup(RIGHT_PWM_CHANNEL, 5000, 8);  // edit frekuensi
-        ledcAttachPin(ena_pin, RIGHT_PWM_CHANNEL);
+      }else if(_rpwm_pin == RIGHT_MOTOR_RPWM){
+        ledcSetup(RIGHT_PWM_CHANNEL_R, 5000, 8);  // edit frekuensi
+        ledcSetup(RIGHT_PWM_CHANNEL_L, 5000, 8);
+        ledcAttachPin(_rpwm_pin, RIGHT_PWM_CHANNEL_R);
+        ledcAttachPin(_lpwm_pin, RIGHT_PWM_CHANNEL_L);
+        _rpwm_channel = RIGHT_PWM_CHANNEL_R;
+        _lpwm_channel = RIGHT_PWM_CHANNEL_L;
 
         // Configure PCNT
         pcnt_config_t pcnt_config_right = {
-          .pulse_gpio_num = RIGHT_ENC_A,
-          .ctrl_gpio_num = RIGHT_ENC_B,
+          .pulse_gpio_num = _enc_a_pin,
+          .ctrl_gpio_num = _enc_b_pin,
           .lctrl_mode = PCNT_MODE_REVERSE,
           .hctrl_mode = PCNT_MODE_KEEP,
           .pos_mode = PCNT_COUNT_INC,
@@ -152,16 +160,14 @@ class Motor {
         pcnt_counter_clear(pcnt_unit_right);
         pcnt_counter_resume(pcnt_unit_right);
       }
-      
-      pinMode(_in1_pin, OUTPUT);
-      pinMode(_in2_pin, OUTPUT);
+    
       pinMode(_enc_a_pin, INPUT_PULLUP);
       pinMode(_enc_b_pin, INPUT_PULLUP);
 
       Motor_pid = new PID(&_pid_input, &_pid_output, &_pid_setpoint, _Kp, _Ki, _Kd, DIRECT);
       Motor_pid->SetMode(AUTOMATIC);
       Motor_pid->SetSampleTime(10); // 50ms same as encoder pooling rate
-      Motor_pid->SetOutputLimits(0, 1023);
+      Motor_pid->SetOutputLimits(0, 255);
     }
 
     float ReadMotorSpeed(){
@@ -172,7 +178,7 @@ class Motor {
         pcnt_get_counter_value(pcnt_unit_right, &count);
       }
       
-      // Read every 50 ms
+      // Read every 10 ms
       unsigned long now = millis();
       unsigned long elapsed = now - prevTime; 
       if (elapsed >= 10) {
@@ -200,51 +206,39 @@ class Motor {
         lastPidTime = now;
       }
 
-      int pwm_output = constrain((int)_pid_output, 0, 1023);
-      
-      if (_ena_pin == LEFT_MOTOR_ENA) {
-        ledcWrite(LEFT_PWM_CHANNEL, uint8_t(pwm_output));
-      } else if (_ena_pin == RIGHT_MOTOR_ENA) {
-        ledcWrite(RIGHT_PWM_CHANNEL, uint8_t(pwm_output));
-      }
+      int pwm_output = constrain((int)_pid_output, 0, 255);
       if (_speed > 0) {
-        MoveForward();
+        MoveForward(pwm_output);
       } else if (_speed < 0) {
-        MoveBackward();
+        MoveBackward(pwm_output);
       } else {
         MotorStop();
       }
     }
 
-    void MoveForward(){
+    void MoveForward(int _pwm){
       if (_isReversed) {
-        digitalWrite(_in1_pin, LOW);
-        digitalWrite(_in2_pin, HIGH);
+        ledcWrite(_rpwm_channel, _pwm);
+        ledcWrite(_lpwm_channel, 0);
       } else {
-        digitalWrite(_in1_pin, HIGH);
-        digitalWrite(_in2_pin, LOW);
+        ledcWrite(_rpwm_channel, 0);
+        ledcWrite(_lpwm_channel, _pwm);
       }
     }
 
-    void MoveBackward(){
+    void MoveBackward(int _pwm){
       if (_isReversed) {
-        digitalWrite(_in1_pin, HIGH);
-        digitalWrite(_in2_pin, LOW);
+        ledcWrite(_rpwm_channel, 0);
+        ledcWrite(_lpwm_channel, _pwm);
       } else {
-        digitalWrite(_in1_pin, LOW);
-        digitalWrite(_in2_pin, HIGH);
+        ledcWrite(_rpwm_channel, _pwm);
+        ledcWrite(_lpwm_channel, 0);
       }
     }
 
     void MotorStop(){
-      digitalWrite(_in1_pin, LOW);
-      digitalWrite(_in2_pin, LOW);
-
-      if (_ena_pin == LEFT_MOTOR_ENA)
-        ledcWrite(LEFT_PWM_CHANNEL, 0);
-      else if (_ena_pin == RIGHT_MOTOR_ENA)
-        ledcWrite(RIGHT_PWM_CHANNEL, 0);
-      
+      ledcWrite(_rpwm_channel, 0);
+      ledcWrite(_lpwm_channel, 0);
       Motor_pid->SetMode(MANUAL);
       _pid_output = 0;
       Motor_pid->SetMode(AUTOMATIC);
@@ -282,8 +276,8 @@ class Motor {
     }
 };
 
-Motor leftMotor(false, LEFT_MOTOR_ENA, LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, LEFT_ENC_A, LEFT_ENC_B);
-Motor rightMotor(true, RIGHT_MOTOR_ENA, RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, RIGHT_ENC_A, RIGHT_ENC_B);
+Motor leftMotor(true, LEFT_MOTOR_RPWM, LEFT_MOTOR_LPWM, LEFT_ENC_A, LEFT_ENC_B);
+Motor rightMotor(false, RIGHT_MOTOR_RPWM, RIGHT_MOTOR_LPWM, RIGHT_ENC_A, RIGHT_ENC_B);
 
 class LedRuntime {
   public:
@@ -312,8 +306,6 @@ class LedRuntime {
 };
 
 LedRuntime Led_1(LED_1);
-LedRuntime Led_2(LED_2);
-LedRuntime Led_3(LED_3);
 
 // Servo object
 Servo Servo_1;
@@ -495,16 +487,18 @@ void processGamepad(ControllerPtr ctl) {
   }
 
   //== PS4 L1 trigger button = 0x0010 ==//
-  if (ctl->buttons() == 0x0010) {
+  if (ctl->buttons() & 0x0010) {
     // code for when L1 button is pushed
+    ServoMoveUp();
   }
   if (ctl->buttons() != 0x0010) {
     // code for when L1 button is released
   }
 
   //== PS4 L2 trigger button = 0x0040 ==//
-  if (ctl->buttons() == 0x0040) {
+  if (ctl->buttons() & 0x0040) {
     // code for when L2 button is pushed
+    ServoMoveDown();
   }
   if (ctl->buttons() != 0x0040) {
     // code for when L2 button is released
@@ -722,7 +716,14 @@ void setup() {
 
   Servo_1.attach(SERVO_1);
   Servo_2.attach(SERVO_2);
-  Servo_3.attach(SERVO_3);
+}
+
+void ServoMoveUp(){
+  Servo_1.write(180);
+}
+
+void ServoMoveDown(){
+  Servo_1.write(0);
 }
 
 void TaskControl(void *pvParameters){
@@ -790,15 +791,15 @@ void TaskControl(void *pvParameters){
     // Serial debugging here
     // Serial.print(millis());
     // Serial.print(",");
-    // Serial.print(rightMotor._pid_input);
+    // Serial.print(rightMotor._pid_output);
     // Serial.print(",");
-    // Serial.println(leftMotor._pid_input);
+    // Serial.println(leftMotor._pid_output);
     
     Serial.print(millis());
     Serial.print(",");
-    Serial.print(setpoint);
+    Serial.print(leftMotor._pid_input);
     Serial.print(",");
-    Serial.println(input);
+    Serial.println(rightMotor._pid_input);
 
     // Serial.print(target_orient);
     // Serial.print(",");
@@ -820,16 +821,12 @@ void TaskRemote(void *pvParameters){
 
     if(isRobotFall){
       Led_1.FlashingLed(200);
-      Led_2.FlashingLed(250);
-      Led_3.FlashingLed(300);
     }else{
       Led_1.TurnOFF();
-      Led_2.TurnOFF();
-      Led_3.TurnOFF();
       if(isRemoteConnected){
         Led_1.TurnOn();
       }else{
-        Led_1.FlashingLed(200);
+        Led_1.FlashingLed(1000);
       }
     }
     SerialPIDTune(); 
