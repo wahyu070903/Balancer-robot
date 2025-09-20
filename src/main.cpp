@@ -44,25 +44,32 @@ SemaphoreHandle_t pidDataMutex;
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 10; //80
-double Ki = 0;
-double Kd = 0;
+double Kp = 20; //80
+double Ki = 240;
+double Kd = 1;
 
-double Kp_orient = 0; //1.2
+double Kp_orient = 4; //1.2
 double Ki_orient = 0; // 6.4
 double Kd_orient = 0; //0.528
 
 double setpoint = 0;
-float deadband = 2;
+float deadband = 0.4;
 double input, output;
 volatile bool dmp_ready;
 double orientation = 0;
+double orientation_unwrapped = 0;
+double last_orientation = 0;
 double target_orient = 0;
 double output_orient = 0;
+double orient_error = 0;
 bool init_orient = false;
 uint8_t serial_tuneOpt = 0;
 bool isRemoteConnected = false;
 bool isRobotFall = false;
+bool isLifterUp = false;
+bool isLifterDown = false;
+float targetAngleOffset = 0;
+float angleCorrection = -2;
 
 uint16_t packetSize;
 uint16_t fifoCount;
@@ -72,12 +79,13 @@ pcnt_unit_t pcnt_unit_left = PCNT_UNIT_0;
 pcnt_unit_t pcnt_unit_right = PCNT_UNIT_1;
 
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
-PID pid_orient(&orientation, &output_orient, &target_orient, Kp_orient, Ki_orient, Kd_orient, DIRECT);
+PID pid_orient(&orient_error, &output_orient, &target_orient, Kp_orient, Ki_orient, Kd_orient, DIRECT);
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 MPU6050 mpu;
 
 void ServoMoveUp();
 void ServoMoveDown();
+float NormalizeYawAngle(float);
 
 void IRAM_ATTR dmpDataReady() {
   dmp_ready = true;
@@ -400,150 +408,114 @@ void dumpGamepad(ControllerPtr ctl) {
 }
 
 // ========= GAME CONTROLLER ACTIONS SECTION ========= //
-
 void processGamepad(ControllerPtr ctl) {
-  // There are different ways to query whether a button is pressed.
-  // By query each button individually:
-  //  a(), b(), x(), y(), l1(), etc...
- 
   //== PS4 X button = 0x0001 ==//
-  if (ctl->buttons() == 0x0001) {
-    // code for when X button is pushed
-  }
-  if (ctl->buttons() != 0x0001) {
-    // code for when X button is released
+  if (ctl->buttons() & 0x0001) {
+    // X button pressed
+  } else {
+    // X button released
   }
 
   //== PS4 Square button = 0x0004 ==//
-  if (ctl->buttons() == 0x0004) {
-    // code for when square button is pushed
-  }
-  if (ctl->buttons() != 0x0004) {
-  // code for when square button is released
+  if (ctl->buttons() & 0x0004) {
+    // Square button pressed
+  } else {
+    // Square button released
   }
 
   //== PS4 Triangle button = 0x0008 ==//
-  if (ctl->buttons() == 0x0008) {
-    // code for when triangle button is pushed
-  }
-  if (ctl->buttons() != 0x0008) {
-    // code for when triangle button is released
+  if (ctl->buttons() & 0x0008) {
+    // Triangle button pressed
+  } else {
+    // Triangle button released
   }
 
   //== PS4 Circle button = 0x0002 ==//
-  if (ctl->buttons() == 0x0002) {
-    // code for when circle button is pushed
-  }
-  if (ctl->buttons() != 0x0002) {
-    // code for when circle button is released
-  }
-
-  //== PS4 Dpad UP button = 0x01 ==//
-  if (ctl->buttons() == 0x01) {
-    // code for when dpad up button is pushed
-  }
-  if (ctl->buttons() != 0x01) {
-    // code for when dpad up button is released
+  if (ctl->buttons() & 0x0002) {
+    // Circle button pressed
+  } else {
+    // Circle button released
   }
 
-  //==PS4 Dpad DOWN button = 0x02==//
-  if (ctl->buttons() == 0x02) {
-    // code for when dpad down button is pushed
-  }
-  if (ctl->buttons() != 0x02) {
-    // code for when dpad down button is released
+  //== Dpad UP = 0x01 ==//
+  if (ctl->dpad() == DPAD_UP) {
+    // Dpad up pressed
   }
 
-  //== PS4 Dpad LEFT button = 0x08 ==//
-  if (ctl->buttons() == 0x08) {
-    // code for when dpad left button is pushed
-  }
-  if (ctl->buttons() != 0x08) {
-    // code for when dpad left button is released
+  //== Dpad DOWN = 0x02 ==//
+  if (ctl->dpad() == DPAD_DOWN) {
+    // Dpad down pressed
   }
 
-  //== PS4 Dpad RIGHT button = 0x04 ==//
-  if (ctl->buttons() == 0x04) {
-    // code for when dpad right button is pushed
-  }
-  if (ctl->buttons() != 0x04) {
-    // code for when dpad right button is released
+  //== Dpad LEFT = 0x08 ==//
+  if (ctl->dpad() == DPAD_LEFT) {
+    // Dpad left pressed
   }
 
-  //== PS4 R1 trigger button = 0x0020 ==//
-  if (ctl->buttons() == 0x0020) {
-    // code for when R1 button is pushed
-  }
-  if (ctl->buttons() != 0x0020) {
-    // code for when R1 button is released
+  //== Dpad RIGHT = 0x04 ==//
+  if (ctl->dpad() == DPAD_RIGHT) {
+    // Dpad right pressed
   }
 
-  //== PS4 R2 trigger button = 0x0080 ==//
-  if (ctl->buttons() == 0x0080) {
-    // code for when R2 button is pushed
-  }
-  if (ctl->buttons() != 0x0080) {
-    // code for when R2 button is released
+  //== PS4 R1 trigger = 0x0020 ==//
+  if (ctl->buttons() & 0x0020) {
+    // R1 pressed
+  } else {
+    // R1 released
   }
 
-  //== PS4 L1 trigger button = 0x0010 ==//
+  //== PS4 R2 trigger = 0x0080 ==//
+  if (ctl->buttons() & 0x0080) {
+    // R2 pressed
+  } else {
+    // R2 released
+  }
+
+  //== PS4 L1 trigger = 0x0010 ==//
   if (ctl->buttons() & 0x0010) {
-    // code for when L1 button is pushed
-    ServoMoveUp();
-  }
-  if (ctl->buttons() != 0x0010) {
-    // code for when L1 button is released
+    // L1 pressed
+    isLifterDown = false;
+    isLifterUp = true;
+  } else {
+    // L1 released
   }
 
-  //== PS4 L2 trigger button = 0x0040 ==//
+  //== PS4 L2 trigger = 0x0040 ==//
   if (ctl->buttons() & 0x0040) {
-    // code for when L2 button is pushed
-    ServoMoveDown();
-  }
-  if (ctl->buttons() != 0x0040) {
-    // code for when L2 button is released
+    // L2 pressed
+    isLifterUp = false;
+    isLifterDown = true;
+  } else {
+    // L2 released
   }
 
-  //== LEFT JOYSTICK - UP ==//
+  //== LEFT JOYSTICK ==//
   if (ctl->axisY() <= -25) {
-    // code for when left joystick is pushed up
-    setpoint = 2; 
+    targetAngleOffset = -2.5; // Up
+  } else if (ctl->axisY() >= 25) {
+    targetAngleOffset = 2.5; // Down
+  } else if (ctl->axisX() <= -25) {
+    // Left
+  } else if (ctl->axisX() >= 25) {
+    // Right
+  } else {
+    targetAngleOffset = 0; // Idle
   }
 
-  //== LEFT JOYSTICK - DOWN ==//
-  if (ctl->axisY() >= 25) {
-    // code for when left joystick is pushed down
-    setpoint = -2;
+  //== RIGHT JOYSTICK ==//
+  int rx = ctl->axisRX();
+  if (rx != 0) {
+    if(rx <= -50){
+      target_orient -= 1.5; // Turn Left
+      target_orient = NormalizeYawAngle(target_orient);
+    }else if(rx >= 50){
+      target_orient += 1.5; // Turn Right
+      target_orient = NormalizeYawAngle(target_orient);
+    }
   }
-
-  //== LEFT JOYSTICK - LEFT ==//
-  if (ctl->axisX() <= -25) {
-    // code for when left joystick is pushed left
+  if (ctl->axisRY() != 0) {
+    // Right stick Y
   }
-
-  //== LEFT JOYSTICK - RIGHT ==//
-  if (ctl->axisX() >= 25) {
-    // code for when left joystick is pushed right
-  }
-
-  //== LEFT JOYSTICK DEADZONE ==//
-  if (ctl->axisY() > -25 && ctl->axisY() < 25 && ctl->axisX() > -25 && ctl->axisX() < 25) {
-    // code for when left joystick is at idle
-    setpoint = 0;
-  }
-
-  //== RIGHT JOYSTICK - X AXIS ==//
-  if (ctl->axisRX()) {
-    // code for when right joystick moves along x-axis
-    
-  }
-
-  //== RIGHT JOYSTICK - Y AXIS ==//
-  if (ctl->axisRY()) {
-  // code for when right joystick moves along y-axis
-  }
-  // Only for debugging
-  // dumpGamepad(ctl);
 }
 
 void processControllers() {
@@ -585,7 +557,10 @@ void SerialPIDTune() {
       serial_tuneOpt = 100;
     }else if(serialInput.startsWith("Balance")){
       serial_tuneOpt = 101;
+    }else if(serialInput.startsWith("correct")){
+      serial_tuneOpt = 102;
     }
+
     if (serialInput.startsWith("Kp=")) {
       if(serial_tuneOpt == 101){
         Kp = serialInput.substring(3).toFloat();
@@ -618,8 +593,11 @@ void SerialPIDTune() {
         pid_orient.SetTunings(Kp_orient, Ki_orient, Kd_orient);
         Serial.print("Updated Kd = "); Serial.println(Kd_orient);
       }
+    }else if(serial_tuneOpt == 102){
+      angleCorrection = serialInput.toFloat();
+      Serial.print("Updated Angle Correction = "); Serial.println(angleCorrection);
     }
-    
+
     serialInput = "";
     newCommand = false;
   }
@@ -629,11 +607,6 @@ float NormalizeYawAngle(float angle){
   while (angle > 180.0) angle -= 360.0;
   while (angle < -180.0) angle += 360.0;
   return angle;
-}
-
-float YawAngleDifferece(float a, float b){
-  float diff = a - b;
-  return NormalizeYawAngle(diff);
 }
 
 void setup() {
@@ -676,12 +649,12 @@ void setup() {
 
   Serial.println("Inisialisasi MPU6050...");
   mpu.initialize();
-  mpu.setXGyroOffset(157);
-  mpu.setYGyroOffset(70);
-  mpu.setZGyroOffset(-107);
-  mpu.setXAccelOffset(342);
-  mpu.setYAccelOffset(154);
-  mpu.setZAccelOffset(216);
+  mpu.setXGyroOffset(139);
+  mpu.setYGyroOffset(82);
+  mpu.setZGyroOffset(-156);
+  mpu.setXAccelOffset(-427);
+  mpu.setYAccelOffset(185);
+  mpu.setZAccelOffset(73);
 
   if (mpu.testConnection()) {
     Serial.println("MPU6050 Connected");
@@ -744,9 +717,9 @@ void TaskControl(void *pvParameters){
         mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
         float robot_angle = ypr[1] * 180/M_PI; // pitch
-        orientation = ypr[0] * 180/M_PI;
+        orientation = ypr[0] * 180/M_PI; // yaw
 
-        input = robot_angle;
+        input = robot_angle - targetAngleOffset + angleCorrection;
         if(init_orient == false){
           target_orient = orientation;
           init_orient = true;
@@ -755,6 +728,7 @@ void TaskControl(void *pvParameters){
       dmp_ready = false;
     }else{
       pid.Compute();
+      orient_error = NormalizeYawAngle(orientation - target_orient);
       pid_orient.Compute();
       if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
         if (input > -50 && input < 50){
@@ -762,15 +736,9 @@ void TaskControl(void *pvParameters){
           float left_speed = output;
           float right_speed = output;
 
-          float orient_error = YawAngleDifferece(target_orient, orientation);
           if(fabs(orient_error) > deadband){
-            if(orient_error > 0){
-              left_speed -= output_orient;
-              right_speed += output_orient;
-            }else{
-              left_speed += output_orient;
-              right_speed -= output_orient;
-            }
+            left_speed += output_orient;
+            right_speed -= output_orient;
           }
           rightMotor.SetMotorSpeed(right_speed);
           leftMotor.SetMotorSpeed(left_speed);
@@ -795,15 +763,19 @@ void TaskControl(void *pvParameters){
     // Serial.print(",");
     // Serial.println(leftMotor._pid_output);
     
-    Serial.print(millis());
-    Serial.print(",");
-    Serial.print(leftMotor._pid_input);
-    Serial.print(",");
-    Serial.println(rightMotor._pid_input);
-
-    // Serial.print(target_orient);
+    // Serial.print(millis());
     // Serial.print(",");
-    // Serial.println(orientation);
+    // Serial.print(setpoint);
+    // Serial.print(",");
+    // Serial.println(input);
+
+    Serial.print(output_orient);
+    Serial.print(",");
+    Serial.print(orient_error);
+    Serial.print(",");
+    Serial.print(target_orient);
+    Serial.print(",");
+    Serial.println(orientation);
 
   }
 }
