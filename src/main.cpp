@@ -32,12 +32,16 @@
 #define SERVO_1 16
 #define SERVO_2 17
 
-#define LMOTOR_KP 0.12
-#define LMOTOR_KI 4
-#define LMOTOR_KD 0.0008
-#define RMOTOR_KP 0.06
-#define RMOTOR_KI 4
-#define RMOTOR_KD 0.0004
+#define LMOTOR_KP 2280
+#define LMOTOR_KI 62645
+#define LMOTOR_KD 19.15
+
+#define RMOTOR_KP 2280
+#define RMOTOR_KI 62645
+#define RMOTOR_KD 20.8
+
+#define RMOTOR_ALPHA 0.2
+#define LMOTOR_ALPHA 0.2
 
 // Task Handle
 TaskHandle_t TaskControlHandle;
@@ -51,24 +55,24 @@ SemaphoreHandle_t pidDataMutex;
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp = 20; //80
-double Ki = 240;
-double Kd = 1.2;
+double Kp_balance = 20;                                                       // 20
+double Ki_balance = 240;                                                      // 240
+double Kd_balance = 1.2;                                                      // 1.2
 
-double Kp_orient = 1.2; //1.2
-double Ki_orient = 0; // 6.4
-double Kd_orient = 0; //0.528
+double Kp_speed = 1;
+double Ki_speed = 0;
+double Kd_speed = 0;
 
-double Kp_position = 0.2;
-double Ki_position = 0.05;
-double Kd_position = 0.01;
-
-const float WHEEL_DIAMETER = 68; // in mm
-const float MM_PER_COUNT = (3.14159 * WHEEL_DIAMETER) / 44.0; // 44 counts per revolution
+const float WHEEL_DIAMETER = 68;                                              // in mm
+const float MM_PER_COUNT = (3.14159 * WHEEL_DIAMETER) / 44.0;                 // 44 counts per revolution
+const float MOTOR_L_RATIO = 9.70;                                             // NOTE: I check it from count the physical gear teeth
+const float MOTOR_R_RATIO = 9.70;
 
 double setpoint = 0;
 float deadband = 1.25;
-double input, output;
+double input_balance, output_balance;
+double output_speed;
+int16_t estimated_speed = 0;
 volatile bool dmp_ready;
 double orientation = 0;
 double orientation_unwrapped = 0;
@@ -93,6 +97,23 @@ double position_output = 0;
 bool position_hold_enabled = false;
 float maxOrientationOffset = 16.0;
 
+double throttle = 0;
+float max_throttle = 180;
+float steering = 0;
+float max_steering = 180;
+
+double target_angle = 0;
+float left_motor_speed = 0;
+float right_motor_speed = 0;
+float actual_robot_speed = 0;
+unsigned long last_micros_velcalc = 0;
+const float GRAVITY = 9.80665;
+const float ALPHA = 0.98;
+float accel_bias = 0.00;
+float vel_accel = 0.0;
+float vel_estimated = 0.0;
+
+
 uint16_t packetSize;
 uint16_t fifoCount;
 uint8_t fifoBuffer[64] = {0};
@@ -100,16 +121,16 @@ uint8_t fifoBuffer[64] = {0};
 pcnt_unit_t pcnt_unit_left = PCNT_UNIT_0;
 pcnt_unit_t pcnt_unit_right = PCNT_UNIT_1;
 
-PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
-PID pid_orient(&orientation_unwrapped, &output_orient, &target_orient, Kp_orient, Ki_orient, Kd_orient, DIRECT);
-PID pid_position(&position_x, &position_output, &target_position, Kp_position, Ki_position, Kd_position, DIRECT);
+PID pid_balance(&input_balance, &output_balance, &setpoint, Kp_balance, Ki_balance, Kd_balance, DIRECT);
+PID pid_speed(&orientation_unwrapped, &output_speed, &throttle, Kp_speed, Ki_speed, Kd_speed, DIRECT);
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 MPU6050 mpu;
 
 void ServoMoveUp();
 void ServoMoveDown();
 float NormalizeYawAngle(float);
-float ExponentialResponse(int, float);
+float ExponentialResponse(int, float, float);
+float SmoothInput(float, float, float);
 
 void IRAM_ATTR dmpDataReady() {
   dmp_ready = true;
@@ -121,16 +142,22 @@ class Motor {
     uint8_t _rpwm_pin, _lpwm_pin;
     uint8_t _rpwm_channel = 0, _lpwm_channel = 0;
     uint8_t _enc_a_pin, _enc_b_pin;
-    volatile long enc_count;
+    volatile long enc_ext = 0;
     volatile long absolute_position = 0;
     long prevCount = 0;
     unsigned long prevTime = 0;
     unsigned long lastPidTime = 0;
     bool isEncInterrupt = false;
-    float motor_rpm = 0;
+    float motor_rpm = 0;                                  // raw rpm from encoder
+    float shaft_rpm = 0;                                  // rpm after gear reduction
+    float wheel_speed = 0;                                // m/s
     double _pid_input, _pid_output, _pid_setpoint = 0;
     double _Kp = 0, _Ki = 0, _Kd = 0;
-    long enc_ext = 0;
+    float motor_rpm_filtered = 0;
+    bool rpm_filter_init = false;
+    float wheel_diameter_mm = 0;
+    float filter_alpha = 0.1;
+    float gear_ratio = 1.0;
     PID* Motor_pid;
 
     Motor(bool reversed, uint8_t rpwm_pin, uint8_t lpwm_pin, uint8_t enc_a_pin, uint8_t enc_b_pin) {
@@ -140,7 +167,7 @@ class Motor {
       _enc_a_pin = enc_a_pin;
       _enc_b_pin = enc_b_pin;  
       // Reset value on startup
-      enc_count = 0;
+      enc_ext = 0;
 
       if(_rpwm_pin == LEFT_MOTOR_RPWM){
         ledcSetup(LEFT_PWM_CHANNEL_R, 5000, 8); // edit: tambah frekuensi 100->20000
@@ -154,7 +181,7 @@ class Motor {
         pcnt_config_t pcnt_config_left = {
           .pulse_gpio_num = _enc_a_pin,
           .ctrl_gpio_num = _enc_b_pin,
-          .lctrl_mode = PCNT_MODE_REVERSE,   // edit
+          .lctrl_mode = PCNT_MODE_REVERSE,  
           .hctrl_mode = PCNT_MODE_KEEP,
           .pos_mode = PCNT_COUNT_INC,
           .neg_mode = PCNT_COUNT_DEC,
@@ -169,7 +196,7 @@ class Motor {
         pcnt_counter_resume(pcnt_unit_left);
 
       }else if(_rpwm_pin == RIGHT_MOTOR_RPWM){
-        ledcSetup(RIGHT_PWM_CHANNEL_R, 5000, 8);  // edit frekuensi
+        ledcSetup(RIGHT_PWM_CHANNEL_R, 5000, 8); 
         ledcSetup(RIGHT_PWM_CHANNEL_L, 5000, 8);
         ledcAttachPin(_rpwm_pin, RIGHT_PWM_CHANNEL_R);
         ledcAttachPin(_lpwm_pin, RIGHT_PWM_CHANNEL_L);
@@ -204,7 +231,7 @@ class Motor {
       Motor_pid->SetOutputLimits(0, 255);
     }
 
-    float ReadMotorSpeed(){
+    float ReadMotorSpeed() {
       int16_t count = 0;
       if(_enc_a_pin == LEFT_ENC_A){
         pcnt_get_counter_value(pcnt_unit_left, &count);
@@ -226,12 +253,14 @@ class Motor {
         else if (delta < -32767) delta += 65536;
 
         float rpm = (delta * 60000.0) / (elapsed * 44.0);
-        motor_rpm = rpm;
+        motor_rpm = FilterRPM(rpm, filter_alpha);
+        shaft_rpm = GearRatio(motor_rpm, gear_ratio);
+        wheel_speed = rpm_to_ms(shaft_rpm, wheel_diameter_mm / 2.0);
 
         prevCount = enc_ext;
         prevTime = now;
       }
-      return motor_rpm;
+      return wheel_speed;
     }
 
     void SetMotorSpeed(float _speed){
@@ -302,32 +331,40 @@ class Motor {
       Motor_pid->SetTunings(_Kp, _Ki, _Kd);
     }
 
-  private:
-    float Median3(float a, float b, float c){
-      if (a > b) { float temp=a; a=b; b=temp; }
-      if (b > c) { float temp=b; b=c; c=temp; }
-      if (a > b) { float temp=a; a=b; b=temp; }
-
-      return b;
+    void SetWheelDiameter(float diameter_mm) {
+      wheel_diameter_mm = diameter_mm;
     }
 
-    float FilterRPM(float raw){
-      static float v1 = 0, v2 = 0;
-      static float ema = 0;
-      static bool init = false;
+    void SetGearRatio(float ratio) {
+      gear_ratio = ratio;
+    }
 
-      float med = Median3(raw, v1, v2);
-      v2 = v1; v1 = raw;
-      // EMA smoothing
-      float alpha = 0.25; // 0.1 = smoother, 0.3 = faster response
-      if (!init) { ema = med; init = true; }
-      ema += alpha * (med - ema);
+    void SetFilterAlpha(float alpha) {
+      filter_alpha = alpha;
+    }
 
-      return ema;
+  private:
+  float FilterRPM(float new_rpm, float alpha) {
+    if (!rpm_filter_init) {
+        motor_rpm_filtered = new_rpm; 
+        rpm_filter_init = true;
+    } else {
+        motor_rpm_filtered = alpha * new_rpm + (1 - alpha) * motor_rpm_filtered;
+    }
+    return motor_rpm_filtered;
+  }
+
+    float rpm_to_ms(float rpm, float radius_mm) {
+      return (rpm / 60.0f) * (2.0f * PI * (radius_mm / 1000.0f));
+    }
+
+    float GearRatio(float motor_rpm, float out_ratio) {
+      if (motor_rpm == 0) return 0;
+      return motor_rpm / out_ratio;
     }
 };
 
-Motor leftMotor(true, LEFT_MOTOR_RPWM, LEFT_MOTOR_LPWM, LEFT_ENC_A, LEFT_ENC_B);
+Motor leftMotor(false, LEFT_MOTOR_RPWM, LEFT_MOTOR_LPWM, LEFT_ENC_A, LEFT_ENC_B);
 Motor rightMotor(false, RIGHT_MOTOR_RPWM, RIGHT_MOTOR_LPWM, RIGHT_ENC_A, RIGHT_ENC_B);
 
 class LedRuntime {
@@ -433,8 +470,6 @@ void processGamepad(ControllerPtr ctl) {
     position_hold_enabled = true;
     target_position = position_x;
     Serial.println("Position hold ENGAGED");
-  } else {
-    // X button released
   }
 
   //== PS4 Square button = 0x0004 ==//
@@ -442,56 +477,6 @@ void processGamepad(ControllerPtr ctl) {
     // Square button pressed
     position_hold_enabled = false;
     Serial.println("Position hold DISENGAGED");
-  } else {
-    // Square button released
-  }
-
-  //== PS4 Triangle button = 0x0008 ==//
-  if (ctl->buttons() & 0x0008) {
-    // Triangle button pressed
-  } else {
-    // Triangle button released
-  }
-
-  //== PS4 Circle button = 0x0002 ==//
-  if (ctl->buttons() & 0x0002) {
-    // Circle button pressed
-  } else {
-    // Circle button released
-  }
-
-  //== Dpad UP = 0x01 ==//
-  if (ctl->dpad() == DPAD_UP) {
-    // Dpad up pressed
-  }
-
-  //== Dpad DOWN = 0x02 ==//
-  if (ctl->dpad() == DPAD_DOWN) {
-    // Dpad down pressed
-  }
-
-  //== Dpad LEFT = 0x08 ==//
-  if (ctl->dpad() == DPAD_LEFT) {
-    // Dpad left pressed
-  }
-
-  //== Dpad RIGHT = 0x04 ==//
-  if (ctl->dpad() == DPAD_RIGHT) {
-    // Dpad right pressed
-  }
-
-  //== PS4 R1 trigger = 0x0020 ==//
-  if (ctl->buttons() & 0x0020) {
-    // R1 pressed
-  } else {
-    // R1 released
-  }
-
-  //== PS4 R2 trigger = 0x0080 ==//
-  if (ctl->buttons() & 0x0080) {
-    // R2 pressed
-  } else {
-    // R2 released
   }
 
   //== PS4 L1 trigger = 0x0010 ==//
@@ -499,38 +484,26 @@ void processGamepad(ControllerPtr ctl) {
     // L1 pressed
     isLifterDown = false;
     isLifterUp = true;
-  } else {
-    // L1 released
-  }
-
-  //== PS4 L2 trigger = 0x0040 ==//
-  if (ctl->buttons() & 0x0040) {
-    // L2 pressed
-    isLifterUp = false;
-    isLifterDown = true;
-  } else {
-    // L2 released
-  }
+  } 
 
   //== LEFT JOYSTICK ==//
   int ly = ctl->axisY();
   if(abs(ly) > 25){
-    targetAngleOffset = ExponentialResponse(ly, maxAngleOffset);
+    float throttle_raw = ExponentialResponse(ly, max_throttle, 1.6);
+    throttle = SmoothInput(throttle_raw, throttle, 0.2);
   } else {
-    targetAngleOffset = 0.0;
+    throttle = 0;
   }
 
   //== RIGHT JOYSTICK ==//
   int rx = ctl->axisRX();
   if (rx != 0) {
-    if(rx <= -50){
-      target_orient -= ExponentialResponse(rx, maxOrientationOffset); // Turn Left
-    }else if(rx >= 50){
-      target_orient += ExponentialResponse(rx, maxOrientationOffset); // Turn Right
+    if(abs(rx) > 25){
+      float steering_raw = ExponentialResponse(rx, max_steering, 1.2);
+      steering = SmoothInput(steering_raw, steering, 0.2);
+    } else {
+      steering = 0;
     }
-  }
-  if (ctl->axisRY() != 0) {
-    // Right stick Y
   }
 }
 
@@ -568,90 +541,61 @@ void SerialPIDTune() {
   // Process the command if we have a complete one
   if (newCommand) {
     serialInput.trim();
-    
-    if(serialInput.startsWith("Orient")){
+    if(serialInput.startsWith("Balance")){
       serial_tuneOpt = 100;
-    }else if(serialInput.startsWith("Balance")){
-      serial_tuneOpt = 101;
     }else if(serialInput.startsWith("Correct")){
-      serial_tuneOpt = 102;
+      serial_tuneOpt = 101;
     }else if(serialInput == "Motor_r"){
-      serial_tuneOpt = 103;
+      serial_tuneOpt = 102;
     }else if(serialInput == "Motor_l"){
-      serial_tuneOpt = 104;
-    }else if(serialInput.startsWith("Position")){
-      serial_tuneOpt = 105; 
+      serial_tuneOpt = 103;
     }
 
     if (serialInput.startsWith("Kp=")) {
-      if(serial_tuneOpt == 101){
-        Kp = serialInput.substring(3).toFloat();
-        pid.SetTunings(Kp, Ki, Kd);
-        Serial.print("Updated Kp = "); Serial.println(Kp);
-      }else if (serial_tuneOpt == 100){
-        Kp_orient = serialInput.substring(3).toFloat();
-        pid_orient.SetTunings(Kp_orient, Ki_orient, Kd_orient);
-        Serial.print("Updated Kp = "); Serial.println(Kp_orient);
-      }else if (serial_tuneOpt == 103){
+      if(serial_tuneOpt == 100){
+        Kp_balance = serialInput.substring(3).toFloat();
+        pid_balance.SetTunings(Kp_balance, Ki_balance, Kd_balance);
+        Serial.print("Updated Kp = "); Serial.println(Kp_balance);
+      }else if (serial_tuneOpt == 102){
         float motor1_kp = serialInput.substring(3).toFloat();
         rightMotor.SetKpid(motor1_kp, rightMotor._Ki, rightMotor._Kd);
-        Serial.print("Updated Motor 1 Kp = "); Serial.println(motor1_kp, 4);
-      }else if (serial_tuneOpt == 104){
+        Serial.print("Updated Motor 1 Kp = "); Serial.println(motor1_kp);
+      }else if (serial_tuneOpt == 103){
         float motor2_kp = serialInput.substring(3).toFloat();
         leftMotor.SetKpid(motor2_kp, leftMotor._Ki, leftMotor._Kd);
-        Serial.print("Updated Motor 2 Kp = "); Serial.println(motor2_kp, 4);
-      }else if (serial_tuneOpt == 105){
-        Kp_position = serialInput.substring(3).toFloat();
-        pid_position.SetTunings(Kp_position, Ki_position, Kd_position);
-        Serial.print("Updated Position Kp = "); Serial.println(Kp_position);
+        Serial.print("Updated Motor 2 Kp = "); Serial.println(motor2_kp);
       }
     } 
     else if (serialInput.startsWith("Ki=")) {
-      if(serial_tuneOpt == 101){
-        Ki = serialInput.substring(3).toFloat();
-        pid.SetTunings(Kp, Ki, Kd);
-        Serial.print("Updated Ki = "); Serial.println(Ki);
-      }else if (serial_tuneOpt == 100){
-        Ki_orient = serialInput.substring(3).toFloat();
-        pid_orient.SetTunings(Kp_orient, Ki_orient, Kd_orient);
-        Serial.print("Updated Ki = "); Serial.println(Ki_orient);
-      }else if (serial_tuneOpt == 103){
+      if(serial_tuneOpt == 100){
+        Ki_balance = serialInput.substring(3).toFloat();
+        pid_balance.SetTunings(Kp_balance, Ki_balance, Kd_balance);
+        Serial.print("Updated Ki = "); Serial.println(Ki_balance);
+      }else if (serial_tuneOpt == 102){
         float motor1_ki = serialInput.substring(3).toFloat();
         rightMotor.SetKpid(rightMotor._Kp, motor1_ki, rightMotor._Kd);
-        Serial.print("Updated Motor 1 Ki = "); Serial.println(motor1_ki, 4); 
-      }else if (serial_tuneOpt == 104){
+        Serial.print("Updated Motor 1 Ki = "); Serial.println(motor1_ki); 
+      }else if (serial_tuneOpt == 103){
         float motor2_ki = serialInput.substring(3).toFloat();
         leftMotor.SetKpid(leftMotor._Kp, motor2_ki, leftMotor._Kd);
-        Serial.print("Updated Motor 2 Ki = "); Serial.println(motor2_ki, 4);
-      }else if (serial_tuneOpt == 105){
-        Ki_position = serialInput.substring(3).toFloat();
-        pid_position.SetTunings(Kp_position, Ki_position, Kd_position);
-        Serial.print("Updated Position Ki = "); Serial.println(Ki_position);
+        Serial.print("Updated Motor 2 Ki = "); Serial.println(motor2_ki);
       }
     } 
     else if (serialInput.startsWith("Kd=")) {
-      if(serial_tuneOpt == 101){
-        Kd = serialInput.substring(3).toFloat();
-        pid.SetTunings(Kp, Ki, Kd);
-        Serial.print("Updated Kd = "); Serial.println(Kd);
-      }else if (serial_tuneOpt == 100){
-        Kd_orient = serialInput.substring(3).toFloat();
-        pid_orient.SetTunings(Kp_orient, Ki_orient, Kd_orient);
-        Serial.print("Updated Kd = "); Serial.println(Kd_orient);
-      }else if (serial_tuneOpt == 103){
+      if(serial_tuneOpt == 100){
+        Kd_balance = serialInput.substring(3).toFloat();
+        pid_balance.SetTunings(Kp_balance, Ki_balance, Kd_balance);
+        Serial.print("Updated Kd = "); Serial.println(Kd_balance);
+      }else if (serial_tuneOpt == 102){
         float motor1_kd = serialInput.substring(3).toFloat();
         rightMotor.SetKpid(rightMotor._Kp, rightMotor._Ki, motor1_kd);
-        Serial.print("Updated Motor 1 Kd = "); Serial.println(motor1_kd, 4);
-      }else if (serial_tuneOpt == 104){
+        Serial.print("Updated Motor 1 Kd = "); Serial.println(motor1_kd);
+      }else if (serial_tuneOpt == 103){
         float motor2_kd = serialInput.substring(3).toFloat(); 
         leftMotor.SetKpid(leftMotor._Kp, leftMotor._Ki, motor2_kd);
-        Serial.print("Updated Motor 2 Kd = "); Serial.println(motor2_kd, 4);
-      }else if (serial_tuneOpt == 105){
-        Kd_position = serialInput.substring(3).toFloat();
-        pid_position.SetTunings(Kp_position, Ki_position, Kd_position);
-        Serial.print("Updated Position Kd = "); Serial.println(Kd_position);
+        Serial.print("Updated Motor 2 Kd = "); Serial.println(motor2_kd);
       }
-    }else if(serial_tuneOpt == 102){
+    }else if(serial_tuneOpt == 101){
       angleCorrection = serialInput.toFloat();
       Serial.print("Updated Angle Correction = "); Serial.println(angleCorrection);
     }
@@ -678,11 +622,15 @@ float UnwrapAngle(double* current_angle, double* last_angle){
   return *current_angle + (rotation_count * 360.0);
 }
 
-float ExponentialResponse(int input, float maxValue){
+float ExponentialResponse(int input, float maxValue, float expVal = 1.5) {
   float normalized = input / 512.0;
   float sign = normalized < 0 ? -1 : 1;
-  float exponential = sign * pow(abs(normalized), 1.5);
+  float exponential = sign * pow(abs(normalized), expVal);
   return exponential * maxValue;
+}
+
+float SmoothInput(float input, float prev, float alpha = 0.2) {
+  return alpha * input + (1 - alpha) * prev;
 }
 
 void setup() {
@@ -690,7 +638,7 @@ void setup() {
   imuDataMutex = xSemaphoreCreateMutex();
   pidDataMutex = xSemaphoreCreateMutex();
   
-  // Task init
+  // Task init (Core 1)
   xTaskCreatePinnedToCore(
     TaskControl,         
     "TaskControl",       
@@ -698,9 +646,10 @@ void setup() {
     NULL,          
     2,                   
     &TaskControlHandle,  
-    1                    // Core 1
+    1                    
   );
 
+  // Task init (Core 0)
   xTaskCreatePinnedToCore(
     TaskRemote,
     "TaskRemote",
@@ -708,7 +657,7 @@ void setup() {
     NULL,
     1,                 
     &TaskRemoteHandle,
-    0                    // Core 0
+    0                   
   );
 
   Serial.begin(115200);
@@ -752,14 +701,6 @@ void setup() {
     while (1);
   }
 
-  pid.SetMode(AUTOMATIC);
-  pid.SetSampleTime(10);
-  pid.SetOutputLimits(-2200, 2200); // Max Motor Speed
-
-  pid_orient.SetMode(AUTOMATIC);
-  pid_orient.SetSampleTime(10);
-  pid_orient.SetOutputLimits(-2200, 2200);
-
   rightMotor.SetKpid(RMOTOR_KP, RMOTOR_KI, RMOTOR_KD);
   leftMotor.SetKpid(LMOTOR_KP, LMOTOR_KI, LMOTOR_KD);
 
@@ -779,125 +720,118 @@ void TaskControl(void *pvParameters){
   (void) pvParameters;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = 5 / portTICK_PERIOD_MS; // 200 Hz
-  double lastLog = 0;
-  pid_position.SetMode(AUTOMATIC);
-  pid_position.SetSampleTime(50);
-  pid_position.SetOutputLimits(-500, 500);
+  pid_balance.SetMode(AUTOMATIC);
+  pid_balance.SetSampleTime(10);
+  pid_balance.SetOutputLimits(-2200, 2200);
+
+  rightMotor.SetGearRatio(MOTOR_R_RATIO);
+  rightMotor.SetWheelDiameter(WHEEL_DIAMETER);
+  rightMotor.SetFilterAlpha(RMOTOR_ALPHA);
+  leftMotor.SetGearRatio(MOTOR_L_RATIO);
+  leftMotor.SetWheelDiameter(WHEEL_DIAMETER);
+  leftMotor.SetFilterAlpha(LMOTOR_ALPHA);
+
+  unsigned long last_toggle = 0;
+  float curr_speed = 0.2;
   for(;;){
     xTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-    float left_distance = leftMotor.GetTravelDistance();
-    float right_distance = rightMotor.GetTravelDistance();
-    position_x = (left_distance + right_distance) / 2.0;
+    // Speed calculated from encoders 
+    // right_motor_speed = rightMotor.ReadMotorSpeed();
+    // left_motor_speed = leftMotor.ReadMotorSpeed();
+    // float vel_enc = (right_motor_speed + left_motor_speed) / 2.0;
+    // actual_robot_speed = vel_enc;
 
-    if (position_hold_enabled && !isRobotFall) {
-      // Compute position correction
-      pid_position.Compute();
-      
-      // Apply position correction to balance setpoint
-      setpoint = targetAngleOffset + (position_output * 0.01); // Scale position correction
-    } else {
-      // Reset position integral when not in position hold mode
-      pid_position.SetMode(MANUAL);
-      pid_position.SetMode(AUTOMATIC);
-      target_position = position_x; // Update target to current position
+    // if(dmp_ready){
+    //   if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+    //     Quaternion q;
+    //     VectorFloat gravity;
+    //     float ypr[3];
+    //     VectorInt16 raw_accel;
+    //     VectorFloat linear_accel;
+
+    //     mpu.dmpGetQuaternion(&q, fifoBuffer);
+    //     mpu.dmpGetGravity(&gravity, &q);
+    //     mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+    //     float robot_angle = ypr[1] * 180/M_PI; // pitch
+    //     orientation = ypr[0] * 180/M_PI; // yaw
+    //     orientation_unwrapped = UnwrapAngle(&orientation, &last_orientation);
+
+    //     input_balance = robot_angle + angleCorrection;
+    //     if (!position_hold_enabled) {
+    //       setpoint = targetAngleOffset;
+    //     }
+    //     if(init_orient == false){
+    //       target_orient = orientation_unwrapped;
+    //       init_orient = true;
+    //     }
+
+    //     // Velocity estimation 
+    //     unsigned long currentTime = micros();
+    //     float dt = (currentTime - last_micros_velcalc) * 1e-6f; // Convert to seconds
+    //     last_micros_velcalc = currentTime;
+    //     mpu.getAcceleration(&raw_accel.x, &raw_accel.y, &raw_accel.z);
+    //     // convert raw accel (±2g scale assumed)
+    //     float ax = (raw_accel.x / 16384.0f) * GRAVITY;
+    //     // remove gravity using DMP gravity vector
+    //     float ax_lin = ax - gravity.x * GRAVITY;
+    //     float a_long = ax_lin;
+    //     a_long -= accel_bias;
+    //     vel_accel += a_long * dt;
+    //     vel_estimated = ALPHA * (vel_accel) + (1.0f - ALPHA) * vel_enc;
+    //   }
+    //   dmp_ready = false;
+    // }else{
+    //   pid_balance.Compute();
+    //   if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
+    //     if (input_balance > -50 && input_balance < 50){
+    //       isRobotFall = false;
+    //       float left_speed = output_balance;
+    //       float right_speed = output_balance;
+
+    //       rightMotor.SetMotorSpeed(right_speed);
+    //       leftMotor.SetMotorSpeed(left_speed);
+    //     }else{
+    //       rightMotor.MotorStop();
+    //       leftMotor.MotorStop();
+    //       // Reset orientation after fall
+    //       init_orient = false;
+    //       isRobotFall = true;
+    //     }
+
+    //     if(isLifterUp){
+    //       ServoMoveUp();
+    //       isLifterUp = false;
+    //     }else if(isLifterDown){
+    //       ServoMoveDown();
+    //       isLifterDown = false;
+    //     }
+    //     xSemaphoreGive(pidDataMutex);
+    //   }
+    // }
+
+    // Serial.print(vel_accel);
+    // Serial.print(",");
+    // Serial.print(actual_robot_speed);
+    // Serial.print(",");
+    // Serial.println(vel_estimated);
+
+    unsigned long now = millis();
+    if (now - last_toggle >= 5000) { 
+      last_toggle = now;
+      int randInt = random(200, 1000);   // dalam skala 0.001
+      curr_speed = randInt / 1000.0;
     }
-
-    if(dmp_ready){
-      if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
-        Quaternion q;
-        VectorFloat gravity;
-        float ypr[3];
-
-        mpu.dmpGetQuaternion(&q, fifoBuffer);
-        mpu.dmpGetGravity(&gravity, &q);
-        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-
-        float robot_angle = ypr[1] * 180/M_PI; // pitch
-        orientation = ypr[0] * 180/M_PI; // yaw
-        orientation_unwrapped = UnwrapAngle(&orientation, &last_orientation);
-
-        input = robot_angle + angleCorrection;
-        if (!position_hold_enabled) {
-          setpoint = targetAngleOffset;
-        }
-        if(init_orient == false){
-          target_orient = orientation_unwrapped;
-          init_orient = true;
-        }
-      }
-      dmp_ready = false;
-    }else{
-      pid.Compute();
-      orient_error = target_orient - orientation_unwrapped;
-      pid_orient.Compute();
-      if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
-        if (input > -50 && input < 50){
-          isRobotFall = false;
-          float left_speed = output;
-          float right_speed = output;
-
-          if(fabs(orient_error) > deadband){
-            left_speed += output_orient;
-            right_speed -= output_orient;
-          }
-          
-          if (position_hold_enabled) {
-            left_speed += position_output;
-            right_speed += position_output;
-          }
-
-          rightMotor.SetMotorSpeed(right_speed);
-          leftMotor.SetMotorSpeed(left_speed);
-        }else{
-          rightMotor.MotorStop();
-          leftMotor.MotorStop();
-          // Reset orientation after fall
-          init_orient = false;
-          isRobotFall = true;
-
-          position_hold_enabled = false;
-        }
-
-        if(isLifterUp){
-          ServoMoveUp();
-          isLifterUp = false;
-        }else if(isLifterDown){
-          ServoMoveDown();
-          isLifterDown = false;
-        }
-        xSemaphoreGive(pidDataMutex);
-      }
-    }
-
-    // rightMotor.SetMotorSpeed(2000);
-    // leftMotor.SetMotorSpeed(2000);
     
-    // When debugging motor PID tuning
-    // Serial.print(millis());
-    // Serial.print(",");
-    // Serial.print(rightMotor._pid_input);
-    // Serial.print(",");
-    // Serial.println(leftMotor._pid_input);
-    
-    // When debugging Balance PID tuning
-    // Serial.print(millis());
-    // Serial.print(",");
-    // Serial.print(setpoint);
-    // Serial.print(",");
-    // Serial.println(input);
+    rightMotor.SetMotorSpeed(curr_speed);
+    leftMotor.SetMotorSpeed(curr_speed);
 
-    // When debugging Orientation PID tuning
-    Serial.print(orientation_unwrapped);
+    Serial.print(curr_speed);
     Serial.print(",");
-    Serial.println(target_orient);
-
-    // When debugging Position PID tuning
-    // Serial.print(left_distance);
-    // Serial.print(",");
-    // Serial.print(right_distance);
-    // Serial.print(",");
-    // Serial.println(position_x);
+    Serial.print(leftMotor._pid_input);
+    Serial.print(",");
+    Serial.println(rightMotor._pid_input);
   }
 }
 
