@@ -24,8 +24,8 @@
 
 #define LEFT_ENC_A 34
 #define LEFT_ENC_B 35
-#define RIGHT_ENC_A 32
-#define RIGHT_ENC_B 33
+#define RIGHT_ENC_A 33
+#define RIGHT_ENC_B 32
 
 #define LED_1 23
 
@@ -55,9 +55,9 @@ SemaphoreHandle_t pidDataMutex;
 
 const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
-double Kp_balance = 20;                                                       // 20
-double Ki_balance = 240;                                                      // 240
-double Kd_balance = 1.2;                                                      // 1.2
+double Kp_balance = 0.008;                                                       // 20
+double Ki_balance = 0;                                                      // 240
+double Kd_balance = 0;                                                      // 1.2
 
 double Kp_speed = 1;
 double Ki_speed = 0;
@@ -98,21 +98,14 @@ bool position_hold_enabled = false;
 float maxOrientationOffset = 16.0;
 
 double throttle = 0;
-float max_throttle = 180;
+float max_throttle = 1.0;
 float steering = 0;
 float max_steering = 180;
 
 double target_angle = 0;
 float left_motor_speed = 0;
 float right_motor_speed = 0;
-float actual_robot_speed = 0;
-unsigned long last_micros_velcalc = 0;
-const float GRAVITY = 9.80665;
-const float ALPHA = 0.98;
-float accel_bias = 0.00;
-float vel_accel = 0.0;
-float vel_estimated = 0.0;
-
+double actual_robot_speed = 0;
 
 uint16_t packetSize;
 uint16_t fifoCount;
@@ -121,8 +114,8 @@ uint8_t fifoBuffer[64] = {0};
 pcnt_unit_t pcnt_unit_left = PCNT_UNIT_0;
 pcnt_unit_t pcnt_unit_right = PCNT_UNIT_1;
 
-PID pid_balance(&input_balance, &output_balance, &setpoint, Kp_balance, Ki_balance, Kd_balance, DIRECT);
-PID pid_speed(&orientation_unwrapped, &output_speed, &throttle, Kp_speed, Ki_speed, Kd_speed, DIRECT);
+PID pid_balance(&input_balance, &output_balance, &target_angle, Kp_balance, Ki_balance, Kd_balance, DIRECT);
+PID pid_speed(&actual_robot_speed, &output_speed, &throttle, Kp_speed, Ki_speed, Kd_speed, DIRECT);
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 MPU6050 mpu;
 
@@ -144,7 +137,7 @@ class Motor {
     uint8_t _enc_a_pin, _enc_b_pin;
     volatile long enc_ext = 0;
     volatile long absolute_position = 0;
-    long prevCount = 0;
+    long prevCount = 0; 
     unsigned long prevTime = 0;
     unsigned long lastPidTime = 0;
     bool isEncInterrupt = false;
@@ -269,7 +262,7 @@ class Motor {
       // Only compute PID at appropriate intervals
       unsigned long now = millis();
       if (now - lastPidTime >= 10) { // Match PID sample time
-        _pid_input = abs(ReadMotorSpeed());
+        _pid_input = abs(this->wheel_speed);
         Motor_pid->Compute();
         lastPidTime = now;
       }
@@ -364,8 +357,8 @@ class Motor {
     }
 };
 
-Motor leftMotor(false, LEFT_MOTOR_RPWM, LEFT_MOTOR_LPWM, LEFT_ENC_A, LEFT_ENC_B);
-Motor rightMotor(false, RIGHT_MOTOR_RPWM, RIGHT_MOTOR_LPWM, RIGHT_ENC_A, RIGHT_ENC_B);
+Motor leftMotor(true, LEFT_MOTOR_RPWM, LEFT_MOTOR_LPWM, LEFT_ENC_A, LEFT_ENC_B);
+Motor rightMotor(true, RIGHT_MOTOR_RPWM, RIGHT_MOTOR_LPWM, RIGHT_ENC_A, RIGHT_ENC_B);
 
 class LedRuntime {
   public:
@@ -543,7 +536,7 @@ void SerialPIDTune() {
     serialInput.trim();
     if(serialInput.startsWith("Balance")){
       serial_tuneOpt = 100;
-    }else if(serialInput.startsWith("Correct")){
+    }else if(serialInput.startsWith("Speed")){
       serial_tuneOpt = 101;
     }else if(serialInput == "Motor_r"){
       serial_tuneOpt = 102;
@@ -556,7 +549,12 @@ void SerialPIDTune() {
         Kp_balance = serialInput.substring(3).toFloat();
         pid_balance.SetTunings(Kp_balance, Ki_balance, Kd_balance);
         Serial.print("Updated Kp = "); Serial.println(Kp_balance);
-      }else if (serial_tuneOpt == 102){
+      }else if(serial_tuneOpt == 101){
+        Kp_speed = serialInput.substring(3).toFloat();
+        pid_speed.SetTunings(Kp_speed, Ki_speed, Kd_speed);
+        Serial.print("Updated Kp = "); Serial.println(Kp_speed);
+      }
+      else if (serial_tuneOpt == 102){
         float motor1_kp = serialInput.substring(3).toFloat();
         rightMotor.SetKpid(motor1_kp, rightMotor._Ki, rightMotor._Kd);
         Serial.print("Updated Motor 1 Kp = "); Serial.println(motor1_kp);
@@ -571,7 +569,12 @@ void SerialPIDTune() {
         Ki_balance = serialInput.substring(3).toFloat();
         pid_balance.SetTunings(Kp_balance, Ki_balance, Kd_balance);
         Serial.print("Updated Ki = "); Serial.println(Ki_balance);
-      }else if (serial_tuneOpt == 102){
+      }else if(serial_tuneOpt == 101){
+        Ki_speed = serialInput.substring(3).toFloat();
+        pid_speed.SetTunings(Kp_speed, Ki_speed, Kd_speed);
+        Serial.print("Updated Ki = "); Serial.println(Ki_speed);
+      }
+      else if (serial_tuneOpt == 102){
         float motor1_ki = serialInput.substring(3).toFloat();
         rightMotor.SetKpid(rightMotor._Kp, motor1_ki, rightMotor._Kd);
         Serial.print("Updated Motor 1 Ki = "); Serial.println(motor1_ki); 
@@ -586,7 +589,12 @@ void SerialPIDTune() {
         Kd_balance = serialInput.substring(3).toFloat();
         pid_balance.SetTunings(Kp_balance, Ki_balance, Kd_balance);
         Serial.print("Updated Kd = "); Serial.println(Kd_balance);
-      }else if (serial_tuneOpt == 102){
+      }else if(serial_tuneOpt == 101){
+        Kd_speed = serialInput.substring(3).toFloat();
+        pid_speed.SetTunings(Kp_speed, Ki_speed, Kd_speed);
+        Serial.print("Updated Kd = "); Serial.println(Kd_speed);
+      }
+      else if (serial_tuneOpt == 102){
         float motor1_kd = serialInput.substring(3).toFloat();
         rightMotor.SetKpid(rightMotor._Kp, rightMotor._Ki, motor1_kd);
         Serial.print("Updated Motor 1 Kd = "); Serial.println(motor1_kd);
@@ -595,9 +603,6 @@ void SerialPIDTune() {
         leftMotor.SetKpid(leftMotor._Kp, leftMotor._Ki, motor2_kd);
         Serial.print("Updated Motor 2 Kd = "); Serial.println(motor2_kd);
       }
-    }else if(serial_tuneOpt == 101){
-      angleCorrection = serialInput.toFloat();
-      Serial.print("Updated Angle Correction = "); Serial.println(angleCorrection);
     }
 
     serialInput = "";
@@ -720,9 +725,12 @@ void TaskControl(void *pvParameters){
   (void) pvParameters;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = 5 / portTICK_PERIOD_MS; // 200 Hz
+  pid_speed.SetMode(AUTOMATIC);
+  pid_speed.SetSampleTime(10);
+  pid_speed.SetOutputLimits(-1000, 1000);
   pid_balance.SetMode(AUTOMATIC);
   pid_balance.SetSampleTime(10);
-  pid_balance.SetOutputLimits(-2200, 2200);
+  pid_balance.SetOutputLimits(-1, 1);
 
   rightMotor.SetGearRatio(MOTOR_R_RATIO);
   rightMotor.SetWheelDiameter(WHEEL_DIAMETER);
@@ -735,110 +743,78 @@ void TaskControl(void *pvParameters){
   float curr_speed = 0.2;
   for(;;){
     xTaskDelayUntil(&xLastWakeTime, xFrequency);
-
     // Speed calculated from encoders 
-    // right_motor_speed = rightMotor.ReadMotorSpeed();
-    // left_motor_speed = leftMotor.ReadMotorSpeed();
-    // float vel_enc = (right_motor_speed + left_motor_speed) / 2.0;
-    // actual_robot_speed = vel_enc;
+    rightMotor.ReadMotorSpeed();
+    leftMotor.ReadMotorSpeed();
+    right_motor_speed = rightMotor.wheel_speed;
+    left_motor_speed = leftMotor.wheel_speed;
+    float vel_enc = (right_motor_speed + left_motor_speed) / 2.0;
+    actual_robot_speed = vel_enc;
 
-    // if(dmp_ready){
-    //   if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
-    //     Quaternion q;
-    //     VectorFloat gravity;
-    //     float ypr[3];
-    //     VectorInt16 raw_accel;
-    //     VectorFloat linear_accel;
+    pid_speed.Compute();
+    pid_balance.Compute();
+    target_angle = 0;
 
-    //     mpu.dmpGetQuaternion(&q, fifoBuffer);
-    //     mpu.dmpGetGravity(&gravity, &q);
-    //     mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+    if(dmp_ready){
+      if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+        Quaternion q;
+        VectorFloat gravity;
+        float ypr[3];
+        VectorInt16 raw_accel;
+        VectorFloat linear_accel;
 
-    //     float robot_angle = ypr[1] * 180/M_PI; // pitch
-    //     orientation = ypr[0] * 180/M_PI; // yaw
-    //     orientation_unwrapped = UnwrapAngle(&orientation, &last_orientation);
+        mpu.dmpGetQuaternion(&q, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-    //     input_balance = robot_angle + angleCorrection;
-    //     if (!position_hold_enabled) {
-    //       setpoint = targetAngleOffset;
-    //     }
-    //     if(init_orient == false){
-    //       target_orient = orientation_unwrapped;
-    //       init_orient = true;
-    //     }
+        float robot_angle = ypr[1] * 180/M_PI; // pitch
+        orientation = ypr[0] * 180/M_PI; // yaw
+        orientation_unwrapped = UnwrapAngle(&orientation, &last_orientation);
 
-    //     // Velocity estimation 
-    //     unsigned long currentTime = micros();
-    //     float dt = (currentTime - last_micros_velcalc) * 1e-6f; // Convert to seconds
-    //     last_micros_velcalc = currentTime;
-    //     mpu.getAcceleration(&raw_accel.x, &raw_accel.y, &raw_accel.z);
-    //     // convert raw accel (±2g scale assumed)
-    //     float ax = (raw_accel.x / 16384.0f) * GRAVITY;
-    //     // remove gravity using DMP gravity vector
-    //     float ax_lin = ax - gravity.x * GRAVITY;
-    //     float a_long = ax_lin;
-    //     a_long -= accel_bias;
-    //     vel_accel += a_long * dt;
-    //     vel_estimated = ALPHA * (vel_accel) + (1.0f - ALPHA) * vel_enc;
-    //   }
-    //   dmp_ready = false;
-    // }else{
-    //   pid_balance.Compute();
-    //   if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
-    //     if (input_balance > -50 && input_balance < 50){
-    //       isRobotFall = false;
-    //       float left_speed = output_balance;
-    //       float right_speed = output_balance;
+        input_balance = robot_angle + angleCorrection;
+      }
+      dmp_ready = false;
+    }else{
+      if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
+        if (input_balance > -50 && input_balance < 50){
+          isRobotFall = false;
+          float left_speed = output_balance;
+          float right_speed = output_balance;
 
-    //       rightMotor.SetMotorSpeed(right_speed);
-    //       leftMotor.SetMotorSpeed(left_speed);
-    //     }else{
-    //       rightMotor.MotorStop();
-    //       leftMotor.MotorStop();
-    //       // Reset orientation after fall
-    //       init_orient = false;
-    //       isRobotFall = true;
-    //     }
+          rightMotor.SetMotorSpeed(left_speed);
+          leftMotor.SetMotorSpeed(right_speed);
+        }else{
+          rightMotor.MotorStop();
+          leftMotor.MotorStop();
+          // Reset orientation after fall
+          init_orient = false;
+          isRobotFall = true;
+        }
 
-    //     if(isLifterUp){
-    //       ServoMoveUp();
-    //       isLifterUp = false;
-    //     }else if(isLifterDown){
-    //       ServoMoveDown();
-    //       isLifterDown = false;
-    //     }
-    //     xSemaphoreGive(pidDataMutex);
-    //   }
-    // }
+        if(isLifterUp){
+          ServoMoveUp();
+          isLifterUp = false;
+        }else if(isLifterDown){
+          ServoMoveDown();
+          isLifterDown = false;
+        }
+        xSemaphoreGive(pidDataMutex);
+      }
+    }      
 
-    // Serial.print(vel_accel);
-    // Serial.print(",");
-    // Serial.print(actual_robot_speed);
-    // Serial.print(",");
-    // Serial.println(vel_estimated);
-
-    unsigned long now = millis();
-    if (now - last_toggle >= 5000) { 
-      last_toggle = now;
-      int randInt = random(200, 1000);   // dalam skala 0.001
-      curr_speed = randInt / 1000.0;
-    }
-    
-    rightMotor.SetMotorSpeed(curr_speed);
-    leftMotor.SetMotorSpeed(curr_speed);
-
-    Serial.print(curr_speed);
+    Serial.print(input_balance);
     Serial.print(",");
-    Serial.print(leftMotor._pid_input);
+    Serial.print(output_balance);
     Serial.print(",");
-    Serial.println(rightMotor._pid_input);
+    Serial.println(rightMotor.wheel_speed);
+
   }
 }
 
 void TaskRemote(void *pvParameters){
   (void) pvParameters;
   TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = 10 / portTICK_PERIOD_MS; // 100 Hz
+  const TickType_t xFrequency = 10 / portTICK_PERIOD_MS; // 200 Hz
 
   for(;;){
     xTaskDelayUntil(&xLastWakeTime, xFrequency);
