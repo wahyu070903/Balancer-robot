@@ -24,8 +24,8 @@
 
 #define LEFT_ENC_A 34
 #define LEFT_ENC_B 35
-#define RIGHT_ENC_A 32
-#define RIGHT_ENC_B 33
+#define RIGHT_ENC_A 33
+#define RIGHT_ENC_B 32
 
 #define LED_1 23
 
@@ -38,6 +38,10 @@
 #define RMOTOR_KP 0.06
 #define RMOTOR_KI 4
 #define RMOTOR_KD 0.0004
+
+#define MAX_MOTOR_RPM 2200
+#define MAX_TILT_ANGLE 4.2
+#define MAX_STEERING 420
 
 // Task Handle
 TaskHandle_t TaskControlHandle;
@@ -63,10 +67,15 @@ double Kp_position = 0.2;
 double Ki_position = 0.05;
 double Kd_position = 0.01;
 
+double Kp_throttle = 0.8;
+double Ki_throttle = 0.2;
+double Kd_throttle = 0.002;
+
 const float WHEEL_DIAMETER = 68; // in mm
 const float MM_PER_COUNT = (3.14159 * WHEEL_DIAMETER) / 44.0; // 44 counts per revolution
 
 double setpoint = 0;
+double manipulated_setpoint = 0;
 float deadband = 1.25;
 double input, output;
 volatile bool dmp_ready;
@@ -83,7 +92,7 @@ bool isRemoteConnected = false;
 bool isRobotFall = false;
 bool isLifterUp = false;
 bool isLifterDown = false;
-float angleCorrection = -1.8;
+float angleCorrection = -7.0;
 float maxAngleOffset = 4.2;
 float targetAngleOffset = 0.0;
 double position_x= 0;
@@ -92,6 +101,15 @@ double position_error = 0;
 double position_output = 0;
 bool position_hold_enabled = false;
 float maxOrientationOffset = 16.0;
+double linear_speed, throttle_input, throttle_output = 0;
+double steering = 0;
+
+bool isLiftUp = false;
+bool isLiftDown = false;
+bool isGripOpen = false;
+bool isGripClose = false;
+bool isThrottleMove = false;
+bool isThrotleReset = false;
 
 uint16_t packetSize;
 uint16_t fifoCount;
@@ -100,9 +118,11 @@ uint8_t fifoBuffer[64] = {0};
 pcnt_unit_t pcnt_unit_left = PCNT_UNIT_0;
 pcnt_unit_t pcnt_unit_right = PCNT_UNIT_1;
 
-PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+PID pid(&input, &output, &manipulated_setpoint, Kp, Ki, Kd, DIRECT);
 PID pid_orient(&orientation_unwrapped, &output_orient, &target_orient, Kp_orient, Ki_orient, Kd_orient, DIRECT);
 PID pid_position(&position_x, &position_output, &target_position, Kp_position, Ki_position, Kd_position, DIRECT);
+PID pid_throttle(&linear_speed, &throttle_output, &throttle_input, Kp_throttle, Ki_throttle, Kd_throttle, DIRECT);
+
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 MPU6050 mpu;
 
@@ -327,7 +347,7 @@ class Motor {
     }
 };
 
-Motor leftMotor(true, LEFT_MOTOR_RPWM, LEFT_MOTOR_LPWM, LEFT_ENC_A, LEFT_ENC_B);
+Motor leftMotor(false, LEFT_MOTOR_RPWM, LEFT_MOTOR_LPWM, LEFT_ENC_A, LEFT_ENC_B);
 Motor rightMotor(false, RIGHT_MOTOR_RPWM, RIGHT_MOTOR_LPWM, RIGHT_ENC_A, RIGHT_ENC_B);
 
 class LedRuntime {
@@ -362,6 +382,14 @@ LedRuntime Led_1(LED_1);
 Servo Servo_1;
 Servo Servo_2;
 Servo Servo_3;
+
+void ResetThrottlePID(){
+  pid_throttle.SetMode(MANUAL);
+  pid_throttle.SetTunings(Kp_throttle, Ki_throttle, Kd_throttle);
+  throttle_input = 0.0;
+  throttle_output = 0.0;
+  pid_throttle.SetMode(AUTOMATIC);
+}
 
 void onConnectedController(ControllerPtr ctl) {
   bool foundEmptySlot = false;
@@ -515,19 +543,23 @@ void processGamepad(ControllerPtr ctl) {
   //== LEFT JOYSTICK ==//
   int ly = ctl->axisY();
   if(abs(ly) > 25){
-    targetAngleOffset = ExponentialResponse(ly, maxAngleOffset);
+    if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE) {
+      throttle_input = ExponentialResponse(ly, MAX_MOTOR_RPM);
+      xSemaphoreGive(pidDataMutex);
+    }
   } else {
-    targetAngleOffset = 0.0;
+    if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE) {
+      throttle_input = 0;
+      xSemaphoreGive(pidDataMutex);
+    }
   }
 
   //== RIGHT JOYSTICK ==//
   int rx = ctl->axisRX();
-  if (rx != 0) {
-    if(rx <= -50){
-      target_orient -= ExponentialResponse(rx, maxOrientationOffset); // Turn Left
-    }else if(rx >= 50){
-      target_orient += ExponentialResponse(rx, maxOrientationOffset); // Turn Right
-    }
+  if(abs(rx) >= 50){
+    steering = ExponentialResponse(rx, MAX_STEERING);
+  }else{
+    steering = 0;
   }
   if (ctl->axisRY() != 0) {
     // Right stick Y
@@ -581,6 +613,8 @@ void SerialPIDTune() {
       serial_tuneOpt = 104;
     }else if(serialInput.startsWith("Position")){
       serial_tuneOpt = 105; 
+    }else if(serialInput.startsWith("Throttle")){
+      serial_tuneOpt = 106;
     }
 
     if (serialInput.startsWith("Kp=")) {
@@ -605,6 +639,11 @@ void SerialPIDTune() {
         pid_position.SetTunings(Kp_position, Ki_position, Kd_position);
         Serial.print("Updated Position Kp = "); Serial.println(Kp_position);
       }
+      else if (serial_tuneOpt == 106){
+        Kp_throttle = serialInput.substring(3).toFloat();
+        pid_throttle.SetTunings(Kp_throttle, Ki_throttle, Kd_throttle);
+        Serial.print("Updated Throttle Kp = "); Serial.println(Kp_throttle);
+      }
     } 
     else if (serialInput.startsWith("Ki=")) {
       if(serial_tuneOpt == 101){
@@ -628,6 +667,11 @@ void SerialPIDTune() {
         pid_position.SetTunings(Kp_position, Ki_position, Kd_position);
         Serial.print("Updated Position Ki = "); Serial.println(Ki_position);
       }
+      else if (serial_tuneOpt == 106){
+        Ki_throttle = serialInput.substring(3).toFloat();
+        pid_throttle.SetTunings(Kp_throttle, Ki_throttle, Kd_throttle);
+        Serial.print("Updated Throttle Ki = "); Serial.println(Ki_throttle);
+      }
     } 
     else if (serialInput.startsWith("Kd=")) {
       if(serial_tuneOpt == 101){
@@ -650,6 +694,10 @@ void SerialPIDTune() {
         Kd_position = serialInput.substring(3).toFloat();
         pid_position.SetTunings(Kp_position, Ki_position, Kd_position);
         Serial.print("Updated Position Kd = "); Serial.println(Kd_position);
+      }else if (serial_tuneOpt == 106){
+        Kd_throttle = serialInput.substring(3).toFloat();
+        pid_throttle.SetTunings(Kp_throttle, Ki_throttle, Kd_throttle);
+        Serial.print("Updated Throttle Kd = "); Serial.println(Kd_throttle);
       }
     }else if(serial_tuneOpt == 102){
       angleCorrection = serialInput.toFloat();
@@ -760,6 +808,14 @@ void setup() {
   pid_orient.SetSampleTime(10);
   pid_orient.SetOutputLimits(-2200, 2200);
 
+  pid_position.SetMode(AUTOMATIC);
+  pid_position.SetSampleTime(50);
+  pid_position.SetOutputLimits(-500, 500);
+
+  pid_throttle.SetMode(AUTOMATIC);
+  pid_throttle.SetSampleTime(10);
+  pid_throttle.SetOutputLimits(-MAX_MOTOR_RPM, MAX_MOTOR_RPM);
+
   rightMotor.SetKpid(RMOTOR_KP, RMOTOR_KI, RMOTOR_KD);
   leftMotor.SetKpid(LMOTOR_KP, LMOTOR_KI, LMOTOR_KD);
 
@@ -775,14 +831,16 @@ void ServoMoveDown(){
   Servo_1.write(0);
 }
 
+float fmap(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
 void TaskControl(void *pvParameters){
   (void) pvParameters;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = 5 / portTICK_PERIOD_MS; // 200 Hz
   double lastLog = 0;
-  pid_position.SetMode(AUTOMATIC);
-  pid_position.SetSampleTime(50);
-  pid_position.SetOutputLimits(-500, 500);
+  float maped_throtle = 0.0;
   for(;;){
     xTaskDelayUntil(&xLastWakeTime, xFrequency);
 
@@ -791,13 +849,9 @@ void TaskControl(void *pvParameters){
     position_x = (left_distance + right_distance) / 2.0;
 
     if (position_hold_enabled && !isRobotFall) {
-      // Compute position correction
       pid_position.Compute();
-      
-      // Apply position correction to balance setpoint
       setpoint = targetAngleOffset + (position_output * 0.01); // Scale position correction
     } else {
-      // Reset position integral when not in position hold mode
       pid_position.SetMode(MANUAL);
       pid_position.SetMode(AUTOMATIC);
       target_position = position_x; // Update target to current position
@@ -815,33 +869,26 @@ void TaskControl(void *pvParameters){
 
         float robot_angle = ypr[1] * 180/M_PI; // pitch
         orientation = ypr[0] * 180/M_PI; // yaw
-        orientation_unwrapped = UnwrapAngle(&orientation, &last_orientation);
 
         input = robot_angle + angleCorrection;
         if (!position_hold_enabled) {
           setpoint = targetAngleOffset;
         }
-        if(init_orient == false){
-          target_orient = orientation_unwrapped;
-          init_orient = true;
-        }
       }
       dmp_ready = false;
     }else{
       pid.Compute();
-      orient_error = target_orient - orientation_unwrapped;
-      pid_orient.Compute();
       if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
-        if (input > -50 && input < 50){
+        linear_speed = ((leftMotor.motor_rpm + rightMotor.motor_rpm) / 2) * -1;
+        pid_throttle.Compute();
+        if (input > -20 && input < 20){
           isRobotFall = false;
-          float left_speed = output;
-          float right_speed = output;
+          maped_throtle = fmap(throttle_output, -MAX_MOTOR_RPM, MAX_MOTOR_RPM, -MAX_TILT_ANGLE, MAX_TILT_ANGLE);
+          manipulated_setpoint = maped_throtle;
 
-          if(fabs(orient_error) > deadband){
-            left_speed += output_orient;
-            right_speed -= output_orient;
-          }
-          
+          float left_speed = output + steering;
+          float right_speed = output - steering;
+
           if (position_hold_enabled) {
             left_speed += position_output;
             right_speed += position_output;
@@ -855,6 +902,7 @@ void TaskControl(void *pvParameters){
           // Reset orientation after fall
           init_orient = false;
           isRobotFall = true;
+          ResetThrottlePID();
 
           position_hold_enabled = false;
         }
@@ -870,34 +918,12 @@ void TaskControl(void *pvParameters){
       }
     }
 
-    // rightMotor.SetMotorSpeed(2000);
-    // leftMotor.SetMotorSpeed(2000);
-    
-    // When debugging motor PID tuning
-    // Serial.print(millis());
-    // Serial.print(",");
-    // Serial.print(rightMotor._pid_input);
-    // Serial.print(",");
-    // Serial.println(leftMotor._pid_input);
-    
-    // When debugging Balance PID tuning
-    // Serial.print(millis());
-    // Serial.print(",");
-    // Serial.print(setpoint);
-    // Serial.print(",");
-    // Serial.println(input);
-
     // When debugging Orientation PID tuning
-    Serial.print(orientation_unwrapped);
+    Serial.print(throttle_input);
     Serial.print(",");
-    Serial.println(target_orient);
-
-    // When debugging Position PID tuning
-    // Serial.print(left_distance);
-    // Serial.print(",");
-    // Serial.print(right_distance);
-    // Serial.print(",");
-    // Serial.println(position_x);
+    Serial.print(manipulated_setpoint);
+    Serial.print(",");
+    Serial.println(linear_speed);
   }
 }
 
