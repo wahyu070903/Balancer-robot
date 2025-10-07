@@ -68,7 +68,7 @@ const char* esp_blu_MAC = "a0:b7:65:14:b7:ae";
 
 double Kp_balance = 20; //80
 double Ki_balance = 240;
-double Kd_balance = 0.8;
+double Kd_balance = 1.2;
 
 double Kp_orient = 1.2; //1.2
 double Ki_orient = 0; // 6.4
@@ -106,7 +106,7 @@ bool init_orient = false;
 uint8_t serial_tuneOpt = 0;
 bool isRemoteConnected = false;
 bool isRobotFall = false;
-float angleCorrection = -8.0;
+float angleCorrection = -8.2;
 float maxAngleOffset = 4.2;
 float targetAngleOffset = 0.0;
 double position_x= 0;
@@ -116,12 +116,14 @@ double position_output = 0;
 bool position_hold_enabled = false;
 float maxOrientationOffset = 16.0;
 double linear_speed, throttle_input, throttle_output = 0;
+float max_accel = 120.0;
 
 bool isLiftUp = false;
 bool isLiftDown = false;
 bool isGripOpen = false;
 bool isGripClose = false;
 bool isThrottleMove = false;
+bool isThrotleReset = false;
 
 uint16_t packetSize;
 uint16_t fifoCount;
@@ -561,6 +563,9 @@ void processGamepad(ControllerPtr ctl) {
   int ly = ctl->axisY();
   if(abs(ly) > 25){
     isThrottleMove = true;
+    if(!isThrotleReset){
+      isThrotleReset = true;
+    }
     int throttle_invert = -ly;
     if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE) {
       throttle_input = ExponentialResponse(throttle_invert, MAX_MOTOR_RPM);
@@ -568,11 +573,14 @@ void processGamepad(ControllerPtr ctl) {
     }
   } else {
     isThrottleMove = false;
-    pid_throttle.SetMode(MANUAL);
-    pid_throttle.SetTunings(Kp_throttle, Ki_throttle, Kd_throttle);
-    throttle_input = 0.0;
-    throttle_output = 0.0;
-    pid_throttle.SetMode(AUTOMATIC);
+    if(isThrotleReset){
+      pid_throttle.SetMode(MANUAL);
+      pid_throttle.SetTunings(Kp_throttle, Ki_throttle, Kd_throttle);
+      throttle_input = 0.0;
+      throttle_output = 0.0;
+      pid_throttle.SetMode(AUTOMATIC);
+      isThrotleReset = false;
+    }
   }
 
   //== RIGHT JOYSTICK ==//
@@ -738,9 +746,9 @@ float NormalizeYawAngle(float angle){
 }
 
 float UnwrapAngle(double* current_angle, double* last_angle){
-  if (*current_angle - *last_angle > 180) {
+  if(*current_angle - *last_angle > 180) {
       rotation_count--;
-  } else if (*current_angle - *last_angle < -180) {
+  }else if (*current_angle - *last_angle < -180) {
       rotation_count++;
   }
   *last_angle = *current_angle;
@@ -882,12 +890,14 @@ void TaskControl(void *pvParameters){
   const TickType_t xFrequency = 5 / portTICK_PERIOD_MS; // 200 Hz
   double lastLog = 0;
   float maped_throtle = 0.0;
+  float last_speed = 0.0;
   for(;;){
     xTaskDelayUntil(&xLastWakeTime, xFrequency);
     float left_rspeed_ms = leftMotor.ReadMotorSpeed();
     float right_rspeed_ms = rightMotor.ReadMotorSpeed();
     float left_rspeed_rpm = leftMotor.motor_rpm;
     float right_rspeed_rpm = rightMotor.motor_rpm;
+    pid_balance.Compute();
 
     linear_speed = (left_rspeed_rpm + right_rspeed_rpm) / 2.0 ;
     float left_speed = 0;
@@ -910,13 +920,8 @@ void TaskControl(void *pvParameters){
       }
       dmp_ready = false;
     }
-
-    pid_balance.Compute();
-    // pid_position.Compute();
+    
     if (xSemaphoreTake(pidDataMutex, portMAX_DELAY) == pdTRUE){
-      if(isThrottleMove){
-        pid_throttle.Compute();
-      }
       if (input_balance > -SAFETY_FALL_ANGLE && input_balance < SAFETY_FALL_ANGLE){
         isRobotFall = false;
         float left_distance = leftMotor.GetTravelDistance();
@@ -925,10 +930,18 @@ void TaskControl(void *pvParameters){
         maped_throtle = fmap(throttle_output, -MAX_MOTOR_RPM, MAX_MOTOR_RPM, -MAX_TILT_ANGLE, MAX_TILT_ANGLE);
         manipulated_setpoint = maped_throtle;
 
+        float delta = output_balance - last_speed;
+        if (delta > max_accel) {
+            output_balance = last_speed + max_accel;
+        } else if (delta < -max_accel) {
+            output_balance = last_speed - max_accel;
+        }
+        last_speed = output_balance;
+
         left_speed = output_balance; 
         right_speed = output_balance;
         rightMotor.SetMotorSpeed(right_speed);
-        leftMotor.SetMotorSpeed(left_speed);
+        leftMotor.SetMotorSpeed(left_speed); 
       }else{
         rightMotor.MotorStop();
         leftMotor.MotorStop();
@@ -969,9 +982,9 @@ void TaskControl(void *pvParameters){
       GripperOpen();
     }
 
-    Serial.print(millis());
-    Serial.print(",");
     Serial.print(input_balance);
+    Serial.print(",");
+    Serial.print(output_balance);
     Serial.print(",");
     Serial.println(manipulated_setpoint);
   }
