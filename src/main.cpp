@@ -27,10 +27,11 @@
 #define RIGHT_ENC_A 33
 #define RIGHT_ENC_B 32
 
-#define LED_1 23
+#define LIFTMOT_IN1 18
+#define LIFTMOT_IN2 26
 
+#define LED_1 23
 #define SERVO_1 16
-#define SERVO_2 17
 
 #define LMOTOR_KP 0.12
 #define LMOTOR_KI 4
@@ -73,6 +74,8 @@ double Kd_throttle = 0.002;
 
 const float WHEEL_DIAMETER = 68; // in mm
 const float MM_PER_COUNT = (3.14159 * WHEEL_DIAMETER) / 44.0; // 44 counts per revolution
+const float GRIPPER_OPEN = 0.0;
+const float GRIPPER_CLOSE = 28.0;
 
 double setpoint = 0;
 double manipulated_setpoint = 0;
@@ -90,8 +93,6 @@ bool init_orient = false;
 uint8_t serial_tuneOpt = 0;
 bool isRemoteConnected = false;
 bool isRobotFall = false;
-bool isLifterUp = false;
-bool isLifterDown = false;
 float angleCorrection = -7.0;
 float maxAngleOffset = 4.2;
 float targetAngleOffset = 0.0;
@@ -104,12 +105,14 @@ float maxOrientationOffset = 16.0;
 double linear_speed, throttle_input, throttle_output = 0;
 double steering = 0;
 
-bool isLiftUp = false;
-bool isLiftDown = false;
+bool isLifterUp = false;
+bool isLifterDown = false;
 bool isGripOpen = false;
 bool isGripClose = false;
 bool isThrottleMove = false;
 bool isThrotleReset = false;
+bool dpadUpPressed = false;
+bool dpadDownPressed = false;
 
 uint16_t packetSize;
 uint16_t fifoCount;
@@ -126,8 +129,8 @@ PID pid_throttle(&linear_speed, &throttle_output, &throttle_input, Kp_throttle, 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 MPU6050 mpu;
 
-void ServoMoveUp();
-void ServoMoveDown();
+void LifterUp();
+void LifterDown();
 float NormalizeYawAngle(float);
 float ExponentialResponse(int, float);
 
@@ -377,11 +380,7 @@ class LedRuntime {
 };
 
 LedRuntime Led_1(LED_1);
-
-// Servo object
 Servo Servo_1;
-Servo Servo_2;
-Servo Servo_3;
 
 void ResetThrottlePID(){
   pid_throttle.SetMode(MANUAL);
@@ -458,44 +457,67 @@ void processGamepad(ControllerPtr ctl) {
   //== PS4 X button = 0x0001 ==//
   if (ctl->buttons() & 0x0001) {
     // X button pressed
-    position_hold_enabled = true;
-    target_position = position_x;
-    Serial.println("Position hold ENGAGED");
+    if(isGripClose == false){
+      isGripOpen = true;
+    }
   } else {
     // X button released
+    isGripOpen = false;
   }
 
   //== PS4 Square button = 0x0004 ==//
   if (ctl->buttons() & 0x0004) {
     // Square button pressed
-    position_hold_enabled = false;
-    Serial.println("Position hold DISENGAGED");
+    if(isGripOpen == false){
+      isGripClose = true;
+    }
   } else {
     // Square button released
+    isGripClose = false;
   }
 
   //== PS4 Triangle button = 0x0008 ==//
   if (ctl->buttons() & 0x0008) {
     // Triangle button pressed
+    if(isLifterDown == false){
+      isLifterUp = true;
+    }
   } else {
     // Triangle button released
+    isLifterUp = false;
   }
 
   //== PS4 Circle button = 0x0002 ==//
   if (ctl->buttons() & 0x0002) {
     // Circle button pressed
+    if(isLifterUp == false){
+      isLifterDown = true;
+    }
   } else {
     // Circle button released
+    isLifterDown = false;
   }
 
   //== Dpad UP = 0x01 ==//
   if (ctl->dpad() == DPAD_UP) {
     // Dpad up pressed
+    if(dpadUpPressed == false){
+      angleCorrection += 0.1;
+      dpadUpPressed = true;
+    }
+  }else{
+    dpadUpPressed = false;
   }
 
   //== Dpad DOWN = 0x02 ==//
   if (ctl->dpad() == DPAD_DOWN) {
     // Dpad down pressed
+    if(dpadDownPressed == false){
+      angleCorrection -= 0.1;
+      dpadDownPressed = true;
+    }
+  }else{
+    dpadDownPressed = false;
   }
 
   //== Dpad LEFT = 0x08 ==//
@@ -525,8 +547,6 @@ void processGamepad(ControllerPtr ctl) {
   //== PS4 L1 trigger = 0x0010 ==//
   if (ctl->buttons() & 0x0010) {
     // L1 pressed
-    isLifterDown = false;
-    isLifterUp = true;
   } else {
     // L1 released
   }
@@ -534,8 +554,6 @@ void processGamepad(ControllerPtr ctl) {
   //== PS4 L2 trigger = 0x0040 ==//
   if (ctl->buttons() & 0x0040) {
     // L2 pressed
-    isLifterUp = false;
-    isLifterDown = true;
   } else {
     // L2 released
   }
@@ -820,15 +838,32 @@ void setup() {
   leftMotor.SetKpid(LMOTOR_KP, LMOTOR_KI, LMOTOR_KD);
 
   Servo_1.attach(SERVO_1);
-  Servo_2.attach(SERVO_2);
+
+  pinMode(LIFTMOT_IN1, OUTPUT);
+  pinMode(LIFTMOT_IN2, OUTPUT);
 }
 
-void ServoMoveUp(){
-  Servo_1.write(180);
+void GripperOpen(){
+  Servo_1.write(GRIPPER_OPEN);
 }
 
-void ServoMoveDown(){
-  Servo_1.write(0);
+void GripperClose(){
+  Servo_1.write(GRIPPER_CLOSE);
+}
+
+void LifterUp(uint8_t pwm){
+  analogWrite(LIFTMOT_IN1, pwm);
+  analogWrite(LIFTMOT_IN2, 0);
+}
+
+void LifterDown(uint8_t pwm){
+  analogWrite(LIFTMOT_IN1, 0);
+  analogWrite(LIFTMOT_IN2, pwm);
+}
+
+void LifterStop(){
+  analogWrite(LIFTMOT_IN1, 0);
+  analogWrite(LIFTMOT_IN2, 0);
 }
 
 float fmap(float x, float in_min, float in_max, float out_min, float out_max) {
@@ -907,13 +942,6 @@ void TaskControl(void *pvParameters){
           position_hold_enabled = false;
         }
 
-        if(isLifterUp){
-          ServoMoveUp();
-          isLifterUp = false;
-        }else if(isLifterDown){
-          ServoMoveDown();
-          isLifterDown = false;
-        }
         xSemaphoreGive(pidDataMutex);
       }
     }
@@ -946,6 +974,22 @@ void TaskRemote(void *pvParameters){
         Led_1.TurnOn();
       }else{
         Led_1.FlashingLed(1000);
+      }
+
+      if(isLifterUp == true){
+        LifterUp(255);
+      }
+      if(isLifterDown == true){
+        LifterDown(255);
+      }
+      if(isLifterUp == false && isLifterDown == false){
+        LifterStop();
+      }
+
+      if(isGripClose){
+        GripperClose();
+      }else if(isGripOpen){
+        GripperOpen();
       }
     }
     SerialPIDTune(); 
